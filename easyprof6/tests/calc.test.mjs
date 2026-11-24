@@ -1,0 +1,447 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { slotHours, endFor } from '../site/js/dates.js';
+import { reminderText, silence } from '../site/js/reminder-text.js';
+import { coverTotals, pct, checkEntry, cumulative, byTerm, activity, gapReport, progressAt } from '../site/js/calc.js';
+import { followUp, noTimetable, makeCtx, dueRange, stats, classProgress, periodOf, shiftPeriod, series, todaySlots, nextNumber, recap, overall, lagStatus, factors } from '../site/js/calc.js';
+import { newDept } from '../site/js/defaults.js';
+
+const S = (d, c, h, extra = {}) => ({ d, c, h, ...extra });
+const mk = (over = {}) => ({
+  dept: newDept({ name: 'GBHS', discipline: 'GEOGRAPHY' }),
+  teachers: [
+    { id: 'K', name: 'Kamdem', short: 'KAMDEM', role: 'ap', slots: [S(1, 'F3A', 2), S(1, 'LSA', 2), S(1, 'F4AR', 1), S(1, 'USA', 1), S(2, 'USA', 4), S(2, 'LSA', 3)] },
+    { id: 'N', name: 'Nebasibi', short: 'NEB', slots: [S(3, 'LSA', 2), S(3, 'USA', 1), S(3, 'F5SC', 2), S(4, 'LSA', 2), S(4, 'USA', 2), S(5, 'F5A', 2), S(5, 'LSA', 1)] },
+    { id: 'A', name: 'Astha', short: 'ASTHA', slots: [S(1, 'F1A', 2), S(1, 'F1B', 2), S(1, 'F1BIL', 2), S(1, 'F3B', 1), S(3, 'F4SC', 2), S(3, 'F4AR', 2), S(4, 'F2A', 2), S(5, 'F3B', 2), S(5, 'F2B', 1), S(5, 'F3A', 1)] },
+    { id: 'T', name: 'Tsogo', short: 'TSOGO', slots: [S(3, 'USA', 3), S(4, 'F5A', 1), S(4, 'F4SC', 1), S(4, 'LSA', 2), S(5, 'USA', 1), S(5, 'F5SC', 1)] },
+  ],
+  classes: ['F3A', 'LSA', 'F4AR', 'USA', 'F1A', 'F5SC'].map((id, i) => ({ id, name: id, cycle: i < 4 && id !== 'F1A' ? '2nd' : '1er', effectif: { total: 50 } })),
+  assign: [], regul: [], entries: [], ...over,
+});
+const E = (id, tid, date, over = {}) => ({ id, teacherId: tid, classId: 'LSA', date, start: '07:30', end: '09:30', minutes: 120, type: 'lesson', n: 1, ...over });
+const P1 = ['2026-09-07', '2026-10-09'];
+
+test('heures dues du 07/09 au 09/10/2026 : 255 h (référence validée : 65 + 60 + 85 + 45)', () => {
+  const c = makeCtx(mk(), '2026-10-13');
+  assert.equal(stats(c, null, ...P1).due, 255);
+  assert.deepEqual(['K', 'N', 'A', 'T'].map(id => stats(c, id, ...P1).due), [65, 60, 85, 45]);
+});
+
+test('calendrier de l’arrêté : vacances de Noël, Pâques, suivi pédagogique et 3e trimestre aux dates officielles', () => {
+  const c = makeCtx(mk(), '2027-06-30');
+  const noel = dueRange(c, 'K', '2026-12-19', '2027-01-03'); assert.equal(noel.due, 0); assert.ok(noel.closed > 0);
+  assert.equal(dueRange(c, 'K', '2027-03-26', '2027-04-11').due, 0, 'Pâques');
+  assert.equal(dueRange(c, 'K', '2026-11-26', '2026-11-27').due, 0, 'deux derniers jours du trimestre');
+  const t3 = dueRange(c, 'K', '2027-04-12', '2027-06-11').due; assert.ok(t3 > 80 && t3 <= 9 * 13, '3e trimestre : dates officielles maintenues jusqu’au 11/06 (' + t3 + ' h dues pour K)');
+  assert.equal(dueRange(c, 'K', '2027-03-08', '2027-03-25').due, 13 * 3, 'du 8 au 25 mars : 3 semaines de cours (lundi + mardi) du 3e trimestre comptent');
+  assert.equal(dueRange(c, 'K', '2026-12-14', '2026-12-18').due, 6 + 7, 'semaine de cours avant les vacances (lundi 6 h + mardi 7 h)');
+});
+
+test('samedi limité à un trimestre', () => {
+  const st = mk(); st.teachers[0].slots.push(S(6, 'USA', 2, { tm: 'T1' }));
+  const c = makeCtx(st, '2027-03-01');
+  assert.equal(dueRange(c, 'K', '2026-09-12', '2026-09-12').due, 2, 'samedi 12/09 (T1)');
+  assert.equal(dueRange(c, 'K', '2027-01-09', '2027-01-09').due, 0, 'samedi 09/01/2027 (T2) : pas de cours');
+});
+
+test('jours sans cours : férié/activités retirés des heures dues, maladie reste due mais non faite', () => {
+  const st = mk({ entries: [{ id: 'a1', teacherId: 'K', type: 'absence', reason: 'sick', date: '2026-10-06' }, { id: 'a2', teacherId: 'A', type: 'absence', reason: 'school', date: '2026-10-09' }] });
+  const c = makeCtx(st, '2026-10-13');
+  const k = stats(c, 'K', ...P1), a = stats(c, 'A', ...P1);
+  assert.equal(k.due, 65); assert.equal(k.absent, 7); assert.equal(k.hours, 0);
+  assert.equal(a.due, 85 - 4); assert.equal(a.excused, 4);
+  const s2 = makeCtx({ ...st, dept: { ...st.dept, dueOut: { school: false } } }, '2026-10-13');
+  assert.equal(stats(s2, 'A', ...P1).due, 85, 'le motif peut être reclassé en absence');
+});
+
+test('heures faites = saisies ; leçons distinctes ; révision/évaluation/orientation sans leçon ; régularisation', () => {
+  const st = mk({ entries: [
+    E('1', 'K', '2026-09-14', { n: 1 }), E('2', 'K', '2026-09-15', { n: 1, minutes: 60 }) /* même leçon en 2 séances */, E('3', 'K', '2026-09-21', { n: 2 }),
+    E('4', 'K', '2026-09-22', { type: 'practical', n: 1, classId: 'USA' }), E('5', 'K', '2026-09-23', { type: 'revision', n: null }), E('6', 'K', '2026-09-24', { type: 'orientation', n: null, minutes: 30 }),
+    E('7', 'K', '2026-09-25', { type: 'assessment', n: null, eval: { evaluated: 40, passed: 30 } }), E('8', 'K', '2026-11-02', { n: 9 }) /* hors période */, E('9', 'K', '2026-09-26', { digital: true, n: 3, deleted: true }),
+  ], regul: [{ id: 'r1', teacherId: 'K', d: '2026-09-07', d2: '2026-10-09', h: -3 }] });
+  const c = makeCtx(st, '2026-10-13'); const k = stats(c, 'K', ...P1);
+  assert.equal(k.hours, (120 + 60 + 120 + 120 + 120 + 30 + 120) / 60 - 3);
+  assert.equal(k.lessonsDone, 2, 'LSA n°1, LSA n°2 ; le TP est compté à part, la révision et l’évaluation ne comptent pas'); assert.equal(k.practical, 1, 'USA TP n°1 compté dans les TP');
+  assert.equal(k.theory, 2); assert.equal(k.practical, 1); assert.equal(k.revisionH, 2); assert.equal(k.orientationH, 0.5);
+  assert.equal(k.successRate, 75); assert.equal(k.regul, -3);
+  assert.equal(stats(c, 'K', '2026-09-14', '2026-09-18').regul, -0.5, '−3 h étalées sur 33 jours, 5 jours dans la semaine : −0,45 arrondi à −0,5');
+});
+
+test('rythme des leçons : attendues proportionnelles aux heures de cours ; retard par classe', () => {
+  const st = mk({ assign: [{ id: 'K:USA', teacherId: 'K', classId: 'USA', th: 20, pr: 0, hours: 0 }] });
+  const c = makeCtx(st, '2026-10-30');
+  const yearH = dueRange(c, 'K', c.ys, c.ye).byClass.USA, partH = dueRange(c, 'K', c.ys, '2026-10-30').byClass.USA;
+  const prog = classProgress(c, 'K', '2026-10-30')[0];
+  assert.equal(prog.classId, 'USA'); assert.equal(prog.expected, Math.round(20 * partH / yearH * 10) / 10);
+  assert.equal(prog.done, 0); assert.equal(prog.status, 'late'); assert.ok(prog.lag > 3);
+  const st2 = mk({ assign: st.assign, entries: Array.from({ length: 5 }, (_, i) => E('x' + i, 'K', '2026-09-1' + i, { classId: 'USA', n: i + 1 })) });
+  const p2 = classProgress(makeCtx(st2, '2026-10-30'), 'K')[0];
+  assert.equal(p2.done, 5); assert.ok(p2.status === 'ok' || p2.status === 'slight' || p2.status === 'ahead');
+  assert.equal(lagStatus(0.5), 'ok'); assert.equal(lagStatus(2), 'slight'); assert.equal(lagStatus(5), 'late'); assert.equal(lagStatus(-2), 'ahead');
+});
+
+test('statistiques : département = somme des enseignants ; alertes de seuil ; période en cours', () => {
+  const st = mk({ entries: [E('1', 'K', '2026-09-14', { minutes: 60 })] });
+  const c = makeCtx(st, '2026-09-18');
+  const all = stats(c, null, '2026-09-07', '2026-09-30');
+  const sum = ['K', 'N', 'A', 'T'].reduce((a, id) => a + stats(c, id, '2026-09-07', '2026-09-30').due, 0);
+  assert.equal(all.due, Math.round(sum * 10) / 10);
+  assert.ok(all.dueFull > all.due, 'la période pas encore écoulée n’est pas comptée comme due');
+  assert.ok(all.alerts.some(a => a.kind === 'hours') && overall(all) === 'late');
+  const full = makeCtx(mk({ entries: [] }), '2026-10-13');
+  assert.equal(stats(full, 'K', ...P1).rate, 0);
+});
+
+test('périodes et séries', () => {
+  const c = makeCtx(mk(), '2026-10-13');
+  const w = periodOf(c, 'week', '2026-10-13'); assert.deepEqual([w.ps, w.pe], ['2026-10-12', '2026-10-17']);
+  const w2 = shiftPeriod(c, w, -1); assert.equal(w2.ps, '2026-10-05');
+  const m = periodOf(c, 'month', '2026-10-13'); assert.deepEqual([m.ps, m.pe], ['2026-10-01', '2026-10-31']);
+  assert.equal(shiftPeriod(c, m, 1).ps, '2026-11-01');
+  const t = periodOf(c, 'term', '2026-10-13'); assert.equal(t.term, 'T1'); assert.equal(shiftPeriod(c, t, 1).term, 'T2'); assert.equal(shiftPeriod(c, shiftPeriod(c, t, 1), 1).term, 'T3');
+  const ser = series(c, null, ...P1); assert.equal(ser.length, 5); assert.equal(ser.reduce((a, b) => a + b.due, 0), 255);
+  assert.equal(periodOf(c, 'year').ps, '2026-09-07');
+});
+
+test('aujourd’hui, numéro suivant, récapitulatif, facteurs', () => {
+  const st = mk({ entries: [E('1', 'K', '2026-10-12', { n: 4 }), E('2', 'K', '2026-10-13', { classId: 'USA', n: 2 }), { id: 'z', teacherId: 'N', type: 'absence', reason: 'sick', date: '2026-10-14' }],
+    assign: [{ id: 'K:LSA', teacherId: 'K', classId: 'LSA', th: 30, pr: 4, hours: 66 }, { id: 'N:LSA', teacherId: 'N', classId: 'LSA', th: 20, pr: 2, hours: 40 }] });
+  const c = makeCtx(st, '2026-10-13');
+  const td = todaySlots(c, 'K', '2026-10-13'); assert.equal(td.teaching, true); assert.equal(td.rows.length, 2);
+  assert.deepEqual(td.rows.map(r => [r.c, r.done]), [['USA', true], ['LSA', false]]);
+  assert.equal(todaySlots(c, 'K', '2026-12-25').teaching, false);
+  assert.equal(nextNumber(c, 'K', 'LSA', 'lesson'), 5); assert.equal(nextNumber(c, 'K', 'F3A', 'lesson'), 1);
+  const r = recap(c, '2026-09-07', '2026-10-13'); const lsa = r.rows.find(x => x.id === 'LSA');
+  assert.equal(lsa.planTh, 50); assert.equal(lsa.planPr, 6); assert.equal(lsa.planH, 106); assert.equal(lsa.th, 1);
+  assert.equal(r.total.planTh, 50);
+  const f = factors(c, stats(c, null, '2026-10-12', '2026-10-17')); assert.ok(f.some(x => x.kind === 'absence' && x.reason === 'sick'));
+});
+
+test('créneau à dates précises (samedis réellement tenus : 19/09 et 03/10) : les autres samedis ne comptent pas', () => {
+  const st = mk(); st.teachers = [{ id: 'K', name: 'Kamdem', short: 'KAMDEM', role: 'ap', slots: [S(6, 'USA', 2, { only: ['2026-09-19', '2026-10-03'] })] }];
+  const c = makeCtx(st, '2026-10-13');
+  assert.equal(dueRange(c, 'K', '2026-09-07', '2026-10-12').due, 4, 'seulement 2 samedis × 2 h');
+  assert.equal(dueRange(c, 'K', '2026-09-12', '2026-09-12').due, 0);
+  assert.equal(todaySlots(c, 'K', '2026-09-19').rows.length, 1);
+  assert.equal(todaySlots(c, 'K', '2026-09-26').rows.length, 0);
+});
+
+test('fiche d’inspection et fiche pédagogique lisent les mêmes saisies : une saisie change les deux', () => {
+  const st = mk({ assign: [{ id: 'K:LSA', teacherId: 'K', classId: 'LSA', th: 10, pr: 0, hours: 40 }] });
+  const before = makeCtx(st, '2026-10-13'), h0 = stats(before, null, ...P1).hours, f0 = followUp(before, ...P1).total.doneH;
+  st.entries = [E('e1', 'K', '2026-09-14')];
+  const after = makeCtx(st, '2026-10-13');
+  assert.equal(stats(after, null, ...P1).hours - h0, 2); assert.equal(followUp(after, ...P1).total.doneH - f0, 2);
+  assert.equal(followUp(after, ...P1).total.rawL, stats(after, null, ...P1).lessonsDone, 'mêmes leçons faites');
+});
+
+test('emploi du temps manquant détecté (pas de pourcentage trompeur)', () => {
+  const st = mk(); st.teachers[1].slots = [];
+  const c = makeCtx(st, '2026-10-13');
+  assert.deepEqual(noTimetable(c, null).map(x => x.id), ['N']); assert.equal(noTimetable(c, 'K').length, 0);
+});
+
+test('heures de début et de fin : la durée ne compte pas les pauses (10:30-10:45 et 12:45-13:15)', () => {
+  assert.equal(slotHours('07:30', '09:30'), 2); assert.equal(slotHours('09:30', '11:45'), 2, 'pause de 15 min déduite');
+  assert.equal(slotHours('11:45', '15:15'), 3, 'pause de 30 min déduite'); assert.equal(slotHours('07:30', '11:45'), 4);
+  assert.equal(endFor('09:30', 2), '11:45'); assert.equal(endFor('11:45', 3), '15:15'); assert.equal(endFor('07:30', 3), '10:30');
+});
+
+test('absence à un cours précis : seul ce cours est compté absent ; un motif « hors faute » le retire des heures dues', () => {
+  const st = mk(); st.teachers = [{ id: 'K', name: 'Kamdem', short: 'KAMDEM', slots: [S(1, 'F3A', 2, { st: '07:30' }), S(1, 'LSA', 2, { st: '09:30' })] }];
+  st.entries = [{ id: 'a1', teacherId: 'K', type: 'absence', classId: 'F3A', date: '2026-10-12', reason: 'unknown', minutes: 0 }];
+  const c = makeCtx(st, '2026-10-13'), d = dueRange(c, 'K', '2026-10-12', '2026-10-12');
+  assert.equal(d.due, 4); assert.equal(d.absent, 2, 'seul le cours F3A est absent');
+  const rows = todaySlots(c, 'K', '2026-10-12').rows; assert.equal(rows.find(r => r.c === 'F3A').absent, 'unknown'); assert.equal(rows.find(r => r.c === 'LSA').absent, '');
+  assert.equal(rows[0].en, '09:30', 'heure de fin déduite');
+  st.entries[0].reason = 'holiday'; const d2 = dueRange(makeCtx(st, '2026-10-13'), 'K', '2026-10-12', '2026-10-12');
+  assert.equal(d2.due, 2); assert.equal(d2.excused, 2);
+});
+
+test('saisie contrôlée : classe absente de l’emploi du temps, jour sans cours, doublon', () => {
+  const st = mk(); st.teachers = [{ id: 'K', name: 'Kamdem', short: 'KAMDEM', slots: [S(1, 'F3A', 2, { st: '07:30' })] }];
+  st.entries = [{ id: 'e1', teacherId: 'K', type: 'lesson', classId: 'F3A', date: '2026-10-12', start: '07:30', end: '09:30', minutes: 120, n: 1 }];
+  const c = makeCtx(st, '2026-10-13'), ck = (o) => checkEntry(c, 'K', { id: 'new', ...o }).map(x => x.kind);
+  assert.deepEqual(ck({ classId: 'F3A', date: '2026-10-12', start: '10:00', end: '11:00' }), [], 'bonne classe, bon jour, pas de chevauchement');
+  assert.deepEqual(ck({ classId: 'LSA', date: '2026-10-12', start: '10:00', end: '11:00' }), ['noslot'], 'LSA n’a pas cours le lundi');
+  assert.deepEqual(ck({ classId: 'F3A', date: '2026-10-11', start: '07:30', end: '09:30' }), ['noday'], 'dimanche');
+  assert.deepEqual(ck({ classId: 'F3A', date: '2026-10-12', start: '08:00', end: '09:00' }), ['dup'], 'chevauche la séance déjà saisie');
+});
+
+test('rappel WhatsApp : le message change avec la durée du silence et liste les cours oubliés', () => {
+  const st = mk(); st.teachers = [{ id: 'K', name: 'Mr. KAMDEM Emmanuel', short: 'KAMDEM', slots: [S(1, 'F3A', 2, { st: '07:30' })] }];
+  const at = (day, last) => { const s2 = { ...st, entries: last ? [{ id: 'x', teacherId: 'K', type: 'lesson', classId: 'F3A', date: last, start: '07:30', end: '09:30', minutes: 120, n: 1 }] : [] }; return makeCtx(s2, day); };
+  const k = (ctx) => reminderText(ctx, ctx.teacher('K'), 'fr');
+  const c1 = at('2026-10-13', '2026-10-12'), c2 = at('2026-10-20', '2026-10-12'), c3 = at('2026-11-02', '2026-10-12'), c0 = at('2026-10-20', '');
+  assert.equal(silence(c1, c1.teacher('K')).level, 1); assert.equal(silence(c2, c2.teacher('K')).level, 2); assert.equal(silence(c3, c3.teacher('K')).level, 3);
+  assert.match(k(c1), /petit rappel/); assert.match(k(c2), /depuis 1 semaine/); assert.match(k(c3), /voilà 3 semaines/); assert.match(k(c0), /aucun cours enregistré/);
+  assert.match(k(c2), /Form|F3A/, 'liste les cours oubliés'); assert.match(reminderText(c3, c3.teacher('K'), 'en'), /3 weeks/);
+});
+
+test('rappel : la liste des classes est celle du collègue concerné, avec sa dernière saisie', () => {
+  const st = mk(); st.assign = [{ id: 'N:F5SC', teacherId: 'N', classId: 'F5SC', th: 10, pr: 0, hours: 20 }, { id: 'A:F1A', teacherId: 'A', classId: 'F1A', th: 10, pr: 0, hours: 20 }];
+  st.entries = [{ id: 'x', teacherId: 'N', type: 'lesson', classId: 'F5SC', date: '2026-10-05', start: '07:30', end: '09:30', minutes: 120, n: 4 }];
+  st.teachers = st.teachers.map(t => ({ ...t, slots: [] }));
+  const c = makeCtx(st, '2026-10-20'), n = reminderText(c, c.teacher('N'), 'fr'), a = reminderText(c, c.teacher('A'), 'fr');
+  assert.match(n, /F5SC : dernière saisie le 5 octobre \(leçon 4\)/); assert.doesNotMatch(n, /F1A/);
+  assert.match(a, /F1A : rien saisi depuis la rentrée/); assert.doesNotMatch(a, /F5SC/);
+});
+
+test('objectifs cumulés : la cible grandit semaine après semaine, le réalisé s’arrête à aujourd’hui, par classe ou pour tout le département', () => {
+  const st = mk({ assign: [{ id: 'K:F3A', teacherId: 'K', classId: 'F3A', th: 30, pr: 0, hours: 60 }, { id: 'K:LSA', teacherId: 'K', classId: 'LSA', th: 60, pr: 0, hours: 120 }] });
+  st.entries = [E('a', 'K', '2026-09-14', { classId: 'F3A', n: 1 }), E('b', 'K', '2026-09-21', { classId: 'F3A', n: 2 })];
+  const c = makeCtx(st, '2026-09-28'), rows = cumulative(c, 'K', null);
+  assert.ok(rows.length > 30 && rows[0].k === 1, 'une ligne par semaine de l’année');
+  for (let i = 1; i < rows.length; i++) assert.ok(rows[i].goalL >= rows[i - 1].goalL - 1e-9, 'la cible ne baisse jamais');
+  assert.ok(rows.find(r => r.future).doneL === null && rows.filter(r => !r.future).every(r => r.doneL != null), 'réalisé seulement jusqu’à aujourd’hui');
+  assert.ok(Math.abs(rows[rows.length - 1].goalL - 90) < 0.6, 'fin d’année : toute la programmation (30 + 60 leçons)');
+  const f3 = cumulative(c, 'K', 'F3A'); assert.equal(f3.filter(r => !r.future).pop().doneL, 2); assert.ok(f3[f3.length - 1].goalL <= 30.6);
+  const t1 = byTerm(c, 'K', null); assert.equal(t1.length, 3); assert.ok(t1[0].goalL > 0 && t1[0].doneL === 2 && t1[2].future);
+  assert.equal(progressAt(c, 'K', null, '2026-09-28').doneL, 2);
+});
+
+test('activité des collègues : semaines actives, classes saisies, régularité', () => {
+  const st = mk({ assign: [{ id: 'K:F3A', teacherId: 'K', classId: 'F3A', th: 30, pr: 0, hours: 60 }, { id: 'K:LSA', teacherId: 'K', classId: 'LSA', th: 60, pr: 0, hours: 120 }] });
+  st.entries = [E('a', 'K', '2026-09-08', { classId: 'F3A', n: 1 }), E('b', 'K', '2026-09-15', { classId: 'F3A', n: 2 }), E('c', 'K', '2026-09-22', { classId: 'F3A', n: 3 })];
+  const c = makeCtx(st, '2026-09-25'), a = activity(c, 'K');
+  assert.equal(a.active, 3); assert.equal(a.weeks, 3); assert.equal(a.level, 'regular'); assert.equal(a.filled, 1, 'LSA jamais saisie'); assert.ok(a.classes >= 2);
+  assert.equal(activity(c, 'N').level, 'inactive'); assert.equal(activity(c, 'N').last, '');
+});
+
+test('à compléter : cours prévus non saisis depuis la rentrée', () => {
+  const st = mk(); st.teachers = st.teachers.slice(0, 1); st.entries = [E('a', 'K', '2026-09-07', { classId: 'F3A' })];
+  const R = gapReport(makeCtx(st, '2026-09-15'), null);
+  assert.ok(R.missing.length > 3 && R.hours > 5, 'beaucoup de cours manquants'); assert.ok(!R.missing.some(m => m.iso === '2026-09-07' && m.row.c === 'F3A'), 'ce qui est saisi n’est plus listé');
+});
+
+test('nouveaux motifs : journée de l’enseignant, établissement fermé, examens… retirent les heures dues ; transport, congé, maladie les laissent dues', async () => {
+  const { REASONS, reasonOf } = await import('../site/js/consts.js');
+  for (const id of ['holiday', 'teacherday', 'pedagogic', 'school', 'council', 'exam', 'closure', 'national', 'classaway']) assert.equal(reasonOf(id).out, true, id);
+  for (const id of ['sick', 'leave', 'personal', 'mission', 'transport', 'unknown', 'other']) assert.equal(reasonOf(id).out, false, id);
+  assert.equal(REASONS[REASONS.length - 1].id, 'other', '« autre » reste le motif de repli');
+  assert.ok(REASONS.every(r => r.fr && r.en && r.icon), 'chaque motif a son texte français et anglais');
+  const st = mk(); st.teachers = [{ id: 'K', name: 'Kamdem', short: 'K', slots: [S(1, 'F3A', 2, { st: '07:30' })] }];
+  st.entries = [{ id: 'a', teacherId: 'K', type: 'absence', date: '2026-10-05', reason: 'teacherday', minutes: 0 }];
+  const d = dueRange(makeCtx(st, '2026-10-13'), 'K', '2026-10-05', '2026-10-05'); assert.equal(d.due, 0); assert.equal(d.excused, 2);
+});
+
+test('rappel : « depuis 2 semaines / 1 mois / 2 mois »', async () => {
+  const { reminderText } = await import('../site/js/reminder-text.js');
+  const st = mk(); st.entries = [E('a', 'K', '2026-09-08', { classId: 'F3A', n: 1 })];
+  const tc = (d) => { const c = makeCtx(st, d); return reminderText(c, c.teacher('K'), 'fr'); };
+  assert.match(tc('2026-09-22'), /2 semaines/); assert.match(tc('2026-10-10'), /1 mois/); assert.match(tc('2026-11-08'), /2 mois/);
+});
+
+test('reprise d’une sauvegarde : identifiants de collègues remplacés, saisies de collègues retirés écartées', async () => {
+  const { remapBackup } = await import('../site/js/import-old.js');
+  const n = { dept: { id: 'x', name: 'D' }, classes: [{ id: 'c1' }, { id: 'c2', deleted: true }], assign: [{ id: 'A:c1', teacherId: 'A', classId: 'c1', th: 5 }, { id: 'Z:c1', teacherId: 'Z', classId: 'c1' }], regul: [], entries: [{ id: 'e1', teacherId: 'A' }, { id: 'e2', teacherId: 'Z' }] };
+  const R = remapBackup(n, { A: 'NEW' }, 99);
+  assert.equal(R.classes.length, 1); assert.deepEqual(R.assign.map(a => [a.id, a.teacherId]), [['NEW:c1', 'NEW']]);
+  assert.equal(R.entries.length, 1); assert.equal(R.entries[0].teacherId, 'NEW'); assert.equal(R.dropped, 1); assert.ok(R.entries.every(e => e.u === 99));
+});
+
+test('changement de serveur : seules mes propres saisies sont gardées et rattachées à mon nouveau compte', async () => {
+  const { foreignData } = await import('../site/js/store.js').catch(() => ({}));
+  if (!foreignData) return;
+  const saved = { data: { dept: { id: 'dOLD' }, teachers: [{ id: 'tA', username: 'astha' }, { id: 'tB', username: 'x' }], entries: [{ id: '1', teacherId: 'tA' }, { id: '2', teacherId: 'tB' }] } };
+  const r = foreignData(saved, { username: 'astha', deptId: 'dNEW', teacherId: 'tNEW' });
+  assert.deepEqual(r.data.entries.map(e => [e.id, e.teacherId]), [['1', 'tNEW']]);
+  assert.equal(foreignData(saved, { username: 'astha', deptId: 'dOLD', teacherId: 'tA' }), null);
+});
+
+test('périodes de 50 min : 7:30 → 9:10 = 2 h de cours ; la fin se calcule avec la durée de période ; pauses déduites', async () => {
+  const { slotHours, endFor, creditMinutes } = await import('../site/js/dates.js');
+  const B = [{ f: '10:00', t: '10:15' }, { f: '12:45', t: '13:20' }];
+  assert.equal(slotHours('07:30', '09:10', B, 50), 2); assert.equal(slotHours('09:10', '11:05', B, 50), 2, 'une pause au milieu n’est pas comptée');
+  assert.equal(endFor('07:30', 2, B, 50), '09:10'); assert.equal(endFor('09:10', 2, B, 50), '11:05');
+  assert.equal(creditMinutes('07:30', '09:10', B, 50), 120); assert.equal(creditMinutes('07:30', '09:30', B, 60), 120, '60 min : inchangé');
+  assert.equal(slotHours('07:30', '09:30', undefined, 60), 2); assert.equal(endFor('07:30', 2), '09:30');
+});
+
+test('« 01:20 » sans PM veut dire 13:20 ; changer la durée de période recalcule les cours de la semaine', async () => {
+  const { normTime, timeToMin, slotHours } = await import('../site/js/dates.js');
+  assert.equal(normTime('01:20'), '13:20'); assert.equal(normTime('07:30'), '07:30'); assert.equal(normTime('12:45'), '12:45'); assert.equal(timeToMin('03:00'), 15 * 60);
+  const B = [{ f: '10:00', t: '10:15' }, { f: '12:45', t: '13:20' }];
+  assert.equal(slotHours('01:20', '03:00', B, 50), 2); assert.equal(slotHours('09:10', '10:00', B, 50), 1); assert.equal(slotHours('10:15', '11:55', B, 50), 2);
+});
+test('applyTiming : les durées stockées sont recalculées (heures de début/fin conservées)', async () => {
+  const store = await import('../site/js/store.js'), act = await import('../site/js/actions.js');
+  store.update(s => { s.data = { ...s.data, dept: { id: 'd', period: 60, breaks: [{ f: '10:30', t: '10:45' }] }, teachers: [{ id: 't', slots: [{ d: 4, c: 'c', st: '09:10', en: '10:00', h: 0.75 }, { d: 4, c: 'c', st: '01:20', en: '03:00', h: 1.75 }] }] }; });
+  act.applyTiming({ period: 50, breaks: [{ f: '10:00', t: '10:15' }, { f: '12:45', t: '13:20' }] });
+  const sl = store.state.data.teachers[0].slots; assert.deepEqual(sl.map(s => s.h), [1, 2]); assert.equal(sl[1].st, '13:20'); assert.equal(store.state.data.dept.period, 50);
+});
+
+test('fixSlot : 7:30→9:20 en périodes de 50 min = 2 périodes, fin ramenée à 9:10 ; stable ; 60 min inchangé', async () => {
+  const { fixSlot } = await import('../site/js/dates.js');
+  const B = [{ f: '10:00', t: '10:15' }, { f: '12:45', t: '13:20' }];
+  const a = fixSlot({ st: '07:30', en: '09:20', h: 2.25 }, B, 50); assert.equal(a.h, 2); assert.equal(a.en, '09:10');
+  assert.deepEqual(fixSlot(a, B, 50), a, 'idempotent');
+  const b = fixSlot({ st: '13:20', en: '15:00', h: 2 }, B, 50); assert.equal(b.h, 2); assert.equal(b.en, '15:00');
+  const c = fixSlot({ st: '07:30', en: '09:30', h: 2 }, undefined, 60); assert.equal(c.h, 2); assert.equal(c.en, '09:30');
+  assert.equal(fixSlot({ st: '07:30', h: 1.5 }, undefined, 60).en, '09:00');
+});
+
+test('programme : niveau d’une classe d’après son nom, programme officiel, saveAssign (heures = théorie + TP)', async () => {
+  const { levelOf, officialFor, isEmptyProgram, totalHours } = await import('../site/js/pages/program.js');
+  assert.equal(levelOf({ name: 'Form 3 G' }), 'form 3'); assert.equal(levelOf({ name: 'Geo 2B' }), 'form 2'); assert.equal(levelOf({ name: 'Geo 1A' }), 'form 1');
+  assert.equal(levelOf({ name: 'Lower Sixth Arts' }), 'lower sixth'); assert.equal(levelOf({ name: 'Upper Sixth Arts' }), 'upper sixth'); assert.equal(levelOf({ name: 'Autre' }), '');
+  assert.deepEqual(officialFor({ name: 'Form 4 G' }), { th: 46, pr: 10, fs: 2, hth: 79, hpr: 21 }); assert.equal(officialFor({ name: 'Autre' }), null);
+  assert.ok(isEmptyProgram({ th: 0, pr: 0 })); assert.ok(!isEmptyProgram({ pr: 3 })); assert.equal(totalHours({ hth: 39, hpr: 27 }), 66); assert.equal(totalHours({ hours: 50 }), 50);
+  const store = await import('../site/js/store.js'), act = await import('../site/js/actions.js');
+  store.update(s => { s.data = { ...s.data, assign: [] }; });
+  act.saveAssign({ teacherId: 't', classId: 'c', th: 13, pr: 9, hth: 39, hpr: 27 });
+  const a = store.state.data.assign[0]; assert.equal(a.hours, 66); assert.equal(a.th, 13); assert.equal(a.hpr, 27);
+  act.saveAssign({ teacherId: 't', classId: 'c', th: 13, pr: 9, hth: 0, hpr: 0, hours: 50 }); assert.equal(store.state.data.assign[0].hours, 50);
+});
+
+test('plusieurs années : archive, vue d’une année passée, comparaison', async () => {
+  const { yearSnapshot, dataForYear, yearsOf, compareYears } = await import('../site/js/calc.js');
+  const st = mk(); st.dept.year = '2026/2027';
+  st.entries = [E('a', 'K', '2026-09-07', { classId: 'F3A', n: 1 })];
+  const snap = yearSnapshot(st);
+  assert.equal(snap.year, '2026/2027'); assert.ok(snap.slots.K.length > 0, 'emplois du temps archivés');
+  const next = { ...st, dept: { ...st.dept, year: '2027/2028', years: [snap], terms: st.dept.terms.map(x => ({ ...x, start: (+x.start.slice(0, 4) + 1) + x.start.slice(4), end: (+x.end.slice(0, 4) + 1) + x.end.slice(4) })), calendar: [] }, teachers: st.teachers.map(t => ({ ...t, slots: [] })) };
+  assert.deepEqual(yearsOf(next), ['2027/2028', '2026/2027']);
+  const old = dataForYear(next, '2026/2027');
+  assert.equal(old.dept.terms[0].start, st.dept.terms[0].start, 'trimestres de l’année archivée'); assert.ok(old.teachers[0].slots.length > 0, 'son emploi du temps');
+  assert.equal(dataForYear(next, ''), next, 'année en cours : données telles quelles');
+  const cmp = compareYears(next, 'K', '2027-10-01');
+  assert.equal(cmp.length, 2); const y1 = cmp.find(r => r.year === '2026/2027');
+  assert.ok(y1.cells.find(c => c.id === 'Y').rateH > 0, 'l’ancienne année garde ses heures faites');
+  assert.ok(y1.cells.find(c => c.id === 'Y').dueH > 0, 'et ses heures dues');
+});
+
+test('rappels : un rendez-vous hebdomadaire avec alarme par jour de cours, jusqu’à la fin de l’année', async () => {
+  const { remindersIcs, teachingDays } = await import('../site/js/reminders.js');
+  const c = makeCtx(mk(), '2026-10-14'), days = teachingDays(c, 'K');
+  assert.ok(days.length >= 1);
+  const ics = remindersIcs(c, 'K', '18:30');
+  assert.equal((ics.match(/BEGIN:VEVENT/g) || []).length, days.length); assert.match(ics, /RRULE:FREQ=WEEKLY;BYDAY=(MO|TU|WE|TH|FR|SA);UNTIL=\d{8}T235959Z/); assert.match(ics, /BEGIN:VALARM/); assert.match(ics, /T183000/);
+});
+
+test('numéro de la première leçon d’une classe reprise en cours de programme', () => {
+  const st = mk({ assign: [{ id: 'K:F3A', teacherId: 'K', classId: 'F3A', th: 16, pr: 0, n0: 27 }] });
+  const c = makeCtx(st, '2026-10-14');
+  assert.equal(nextNumber(c, 'K', 'F3A', 'lesson'), 27);
+  st.entries = [E('a', 'K', '2026-10-05', { classId: 'F3A', n: 27 })];
+  assert.equal(nextNumber(makeCtx(st, '2026-10-14'), 'K', 'F3A', 'lesson'), 28);
+});
+
+test('leçons, TP et further study sont séparés : seules les leçons comptent dans la couverture du programme', () => {
+  const st = mk({ assign: [{ id: 'K:F3A', teacherId: 'K', classId: 'F3A', th: 42, pr: 4 }] });
+  st.entries = [E('a', 'K', '2026-09-07', { classId: 'F3A', n: 1 }), E('b', 'K', '2026-09-08', { classId: 'F3A', n: 1, type: 'practical' }), E('c', 'K', '2026-09-09', { classId: 'F3A', n: 1, type: 'further' })];
+  const S = stats(makeCtx(st, '2026-10-14'), 'K', '2026-09-07', '2026-10-14');
+  assert.equal(S.lessonsDone, 1); assert.equal(S.practical, 1); assert.equal(S.further, 1);
+  assert.equal(S.planYear.lessons, 42, '42 leçons, pas 46'); assert.equal(S.practicalPlanned, 4);
+});
+
+test('fiche pédagogique : heures de théorie / TP du programme, TP et further study à part', () => {
+  const st = mk({ assign: [{ id: 'K:F3A', teacherId: 'K', classId: 'F3A', th: 42, pr: 2, fs: 2, hth: 60, hpr: 6, hours: 66 }] });
+  st.entries = [E('a', 'K', '2026-09-07', { classId: 'F3A', n: 1, type: 'practical' }), E('b', 'K', '2026-09-08', { classId: 'F3A', type: 'practical', n: null }), E('c', 'K', '2026-09-09', { classId: 'F3A', n: 1, type: 'further' })];
+  const R = followUp(makeCtx(st, '2026-10-14'), '2026-09-07', '2026-10-14'), r = R.rows ? R.rows[0] : R.total;
+  const tot = R.total; assert.equal(tot.planPr, 2); assert.equal(tot.pr, 2, 'TP sans numéro comptés aussi'); assert.equal(tot.rawL, 0, 'les TP et further study ne comptent pas dans les leçons');
+});
+
+test('Sixth Form : catalogue des sous-branches (totaux, TP, further study), titres des leçons, ordre d’enseignement', async () => {
+  const { BRANCHES } = await import('../site/js/syllabus.js');
+  const { sumBranches, lessonInfo, infoText, sbsOf } = await import('../site/js/pages/program.js');
+  const sum = (ids) => sumBranches(ids);
+  assert.deepEqual(sum(['met', 'clim', 'hydro', 'geomo', 'bio']), { th: 78, pr: 4, fs: 5 }, 'Lower Sixth : 18+3+13+16+28 leçons');
+  assert.deepEqual(sum(['pop', 'set', 'eco']), { th: 70, pr: 11, fs: 0 }, 'Upper Sixth : 18+22+30 = 70 leçons, comme la fiche nationale');
+  assert.equal(sum(['env']).th, 14); assert.equal(sum(['cam']).th, 0, 'Cameroun = further study, pas des leçons'); assert.equal(sum(['cam']).fs, 15); assert.equal(sum(['prac']).th, 0);
+  assert.equal(BRANCHES.find(b => b.id === 'eco').items.l.some(([n]) => n === 12), false, 'la leçon 12 n’existe pas en Economic Geography (31 numéros, 30 leçons)');
+  assert.equal(sumBranches(['met', 'clim'], 10).th, 21 - 9, 'reprise à la leçon 10 : il en reste 12');
+  // Kamdem, Lower Sixth : Meteorology puis Population → n° 1-18 = Meteorology, n° 19-36 = Population
+  const a = { sbs: 'met,pop,zzz' }; assert.deepEqual(sbsOf(a), ['met', 'pop']);
+  assert.match(infoText(lessonInfo(a, 'lesson', 3)), /^Meteorology · Solar Radiation/);
+  assert.match(infoText(lessonInfo(a, 'lesson', 19)), /^Population Geography · Sources of Population Data/);
+  assert.equal(lessonInfo(a, 'lesson', 37), null); assert.equal(lessonInfo({}, 'lesson', 1), null);
+  assert.match(infoText(lessonInfo({ sbs: 'cam' }, 'further', 2)), /Climate of Cameroon/);
+});
+
+test('Sixth Form : deux enseignants dans la même classe, chacun compte ses propres leçons', async () => {
+  const { sumBranches } = await import('../site/js/pages/program.js');
+  const kam = sumBranches(['met', 'pop']), neb = sumBranches(['set', 'clim', 'hydro']);
+  const st = mk({ assign: [{ id: 'K:LSA', teacherId: 'K', classId: 'LSA', ...kam, hours: 0 }, { id: 'N:LSA', teacherId: 'N', classId: 'LSA', ...neb, hours: 0 }],
+    entries: [E('a', 'K', '2026-09-08', { n: 1 }), E('b', 'K', '2026-09-15', { n: 2 }), E('c', 'N', '2026-09-10', { n: 1 })] });
+  const c = makeCtx(st, '2026-10-13');
+  const k = classProgress(c, 'K').find(r => r.classId === 'LSA'), n = classProgress(c, 'N').find(r => r.classId === 'LSA');
+  assert.equal(k.plan.total, 36); assert.equal(k.done, 2); assert.equal(n.plan.total, 38); assert.equal(n.done, 1);
+});
+
+test('Form 3 repris en Form 4 à partir de la leçon 24 : 19 leçons, numérotées 24 à 42, à côté de la Human Geography de l’autre enseignant', () => {
+  const st = mk({ assign: [{ id: 'K:F4AR', teacherId: 'K', classId: 'F4AR', th: 19, pr: 2, fs: 2, n0: 24, hours: 0 }, { id: 'A:F4AR', teacherId: 'A', classId: 'F4AR', th: 46, hours: 0 }], entries: [] });
+  let c = makeCtx(st, '2026-10-13');
+  assert.equal(nextNumber(c, 'K', 'F4AR', 'lesson'), 24); assert.equal(nextNumber(c, 'A', 'F4AR', 'lesson'), 1);
+  st.entries = [E('x', 'K', '2026-09-08', { classId: 'F4AR', n: 24 }), E('y', 'A', '2026-09-09', { classId: 'F4AR', n: 1 }), E('z', 'A', '2026-09-16', { classId: 'F4AR', n: 2 })];
+  c = makeCtx(st, '2026-10-13');
+  assert.equal(nextNumber(c, 'K', 'F4AR', 'lesson'), 25);
+  const rk = classProgress(c, 'K').find(r => r.classId === 'F4AR'), ra = classProgress(c, 'A').find(r => r.classId === 'F4AR');
+  assert.equal(rk.done, 1); assert.equal(rk.plan.total, 19); assert.equal(ra.done, 2); assert.equal(ra.plan.total, 46, 'chaque enseignant a son propre programme dans la même classe');
+});
+
+test('fiche de suivi = accueil : même calcul, jamais plus de 100 % par classe, les trimestres s’additionnent au programme de l’année', () => {
+  const as = [['K', 'F3A', 42, 60], ['K', 'LSA', 77, 270], ['N', 'LSA', 77, 270], ['A', 'F1A', 13, 66], ['T', 'USA', 70, 271]].map(([teacherId, classId, th, h]) => ({ id: teacherId + ':' + classId, teacherId, classId, th, hth: h, hpr: 0, hours: h }));
+  const st = mk({ assign: as, regul: [{ id: 'r1', teacherId: 'A', classId: 'F1A', d: '2026-09-07', d2: '2026-10-09', h: 30, lessons: 40 }],
+    entries: [E('a', 'K', '2026-09-08', { n: 1 }), E('b', 'K', '2026-09-15', { n: 2 }), E('c', 'N', '2026-09-10', { n: 1 }), E('d', 'K', '2026-10-06', { n: 1, classId: 'F3A' }), E('e', 'A', '2026-09-08', { n: 1, classId: 'F1A' })] });
+  const c = makeCtx(st, '2026-10-13'), T = c.terms, near = (a, b, m) => assert.ok(Math.abs(a - b) < 0.06, m + ' : ' + a + ' ≠ ' + b);
+  const F1 = followUp(c, T[0].start, T[0].end), all = [...F1.g1, ...F1.g2];
+  for (const r of all) { assert.ok(r.rateL <= 100 && r.rateH <= 100, r.name + ' ≤ 100 %'); assert.ok(r.doneL <= r.planL + 1e-9 && r.doneH <= r.planH + 1e-9); }
+  const f1a = all.find(r => r.id === 'F1A'); assert.equal(f1a.doneL, f1a.planL, 'régularisation excessive : plafonnée au prévu'); assert.equal(f1a.rateL, 100); assert.ok(F1.over.some(r => r.id === 'F1A'), 'dépassement signalé à l’écran');
+  const C1 = coverTotals(c, T[0].start, T[0].end); near(F1.total.doneL, C1.doneL, 'leçons faites = accueil'); near(F1.total.planL, C1.planL, 'leçons prévues = accueil'); near(F1.total.rateH, C1.rateH, '% heures = accueil'); near(F1.total.rateL, C1.rateL, '% leçons = accueil');
+  // trimestres + année : prévu additif, exact
+  const parts = c.terms.map(tm => followUp(c, tm.start, tm.end).total), Y = followUp(c, c.ys, c.ye).total;
+  assert.equal(parts.reduce((a, x) => a + x.planL, 0), Y.planL, 'leçons prévues : somme des trimestres = année'); assert.equal(Y.planL, 13 + 42 + 77 + 77 + 70, 'prévu de l’année = programme de toutes les affectations');
+  near(parts.reduce((a, x) => a + x.planH, 0), Y.planH, 'heures prévues : somme des trimestres = année');
+  // accueil par enseignant : somme des enseignants = département
+  const byT = c.teachers.map(t => coverTotals(c, T[0].start, T[0].end, t.id)); near(byT.reduce((a, x) => a + x.doneL, 0), C1.doneL, 'enseignants → département');
+});
+
+test('correction d’examen / remise des copies : les heures comptent, aucune leçon', () => {
+  const st = mk({ assign: [{ id: 'K:LSA', teacherId: 'K', classId: 'LSA', th: 10, hth: 40, hpr: 0, hours: 40 }], entries: [E('c1', 'K', '2026-09-14', { type: 'correction', n: null })] });
+  const c = makeCtx(st, '2026-10-13'), S = stats(c, 'K', ...P1);
+  assert.equal(S.hours, 2); assert.equal(S.lessonsDone, 0); assert.equal(S.assessH, 2);
+});
+
+test('progression : semaines de la fiche → dates (vacances sautées), parties de Form 5, reprise Form 3 → Form 4, date de début décalée', async () => {
+  const { weekMonday, planOf, partsOf } = await import('../site/js/progress.js');
+  const c = makeCtx(mk(), '2026-11-23');
+  assert.equal(weekMonday(c, 'T1W1'), '2026-09-07'); assert.equal(weekMonday(c, 'T1W2'), '2026-09-14'); assert.equal(weekMonday(c, 'T2W4'), '2027-01-04', 'après les vacances de Noël');
+  const f3 = planOf(c, { level: 'form 3' }, null); assert.equal(f3.filter(x => x.k === 'l').length, 42); assert.equal(f3.find(x => x.n === 5 && x.k === 'l').date, '2026-10-12');
+  const f4 = planOf(c, { level: 'form 4' }, null).filter(x => x.k === 'l'); assert.equal(f4.length, 46); assert.match(f4.find(x => x.n === 39).t, /Forest resources/);
+  assert.deepEqual(partsOf('form 5').map(p => p.lessons), [9, 44]);
+  const cam = planOf(c, { level: 'form 5', part: 'cam' }, null); assert.equal(cam.filter(x => x.k === 'l').length, 9); assert.equal(cam.filter(x => x.k === 'p').length, 5);
+  const rep = planOf(c, { level: 'form 3', n0: 24 }, null).filter(x => x.k === 'l'); assert.equal(rep.length, 19); assert.equal(rep[0].n, 24);
+  const late = planOf(c, { level: 'form 3', start: '2026-10-05' }, null).find(x => x.k === 'l' && x.n === 1); assert.equal(late.date, '2026-10-05', 'arrivé 4 semaines plus tard : ses dates partent de son premier cours');
+});
+
+test('où j’en suis, leçon proposée, leçon en cours : heures comptées, leçon comptée seulement une fois terminée', async () => {
+  const { whereAmI, suggestLesson } = await import('../site/js/progress.js');
+  const st = mk({ assign: [{ id: 'K:F3A', teacherId: 'K', classId: 'F3A', th: 42, level: 'form 3', hours: 0 }],
+    entries: [E('1', 'K', '2026-09-07', { classId: 'F3A', n: 1 }), E('2', 'K', '2026-09-14', { classId: 'F3A', n: 2 }), E('3', 'K', '2026-09-21', { classId: 'F3A', n: 3, done: false })] });
+  const c = makeCtx(st, '2026-10-19');
+  const s = suggestLesson(c, 'K', 'F3A'); assert.equal(s.n, 3); assert.ok(s.inProgress, 'la leçon en cours est proposée en premier');
+  const w = whereAmI(c, 'K', 'F3A'); assert.equal(w.status, 'late'); assert.equal(w.expected.n, 6); assert.equal(w.done, 2);
+  const S = stats(c, 'K', '2026-09-07', '2026-10-19'); assert.equal(S.lessonsDone, 2, 'leçon 3 en cours : pas encore comptée'); assert.equal(S.hours, 6, 'mais ses 2 h comptent');
+  st.entries.push(E('4', 'K', '2026-09-28', { classId: 'F3A', n: 3 })); const c2 = makeCtx(st, '2026-10-19');
+  assert.equal(stats(c2, 'K', '2026-09-07', '2026-10-19').lessonsDone, 3); assert.equal(suggestLesson(c2, 'K', 'F3A').n, 4);
+});
+
+test('évaluations par séquence : dernière remédiation, cumul du trimestre, filles / garçons, fiche de suivi', async () => {
+  const { seqResults, cumulate, evalWeekOf } = await import('../site/js/progress.js');
+  const st = mk({ entries: [
+    E('a', 'K', '2026-10-14', { classId: 'F3A', type: 'assessment', n: null, seq: 1, res: { cf: 30, cg: 28, pf: 27, pg: 26 } }),
+    E('b', 'K', '2026-10-21', { classId: 'F3A', type: 'correction', n: null, seq: 1, res: { cf: 30, cg: 28, pf: 27, pg: 26, rf: 18, rg: 14 } }),
+    E('c', 'K', '2026-11-30', { classId: 'F3A', type: 'correction', n: null, seq: 2, res: { cf: 30, cg: 28, pf: 25, pg: 25, rf: 10, rg: 10 } })] });
+  const c = makeCtx(st, '2026-12-01'), R = seqResults(c);
+  assert.equal(R.F3A[1].rf, 18); assert.ok(R.F3A[1].remed);
+  const t1 = cumulate([R.F3A[1], R.F3A[2]]); assert.equal(t1.comp, 103); assert.equal(t1.pass, 52); assert.equal(t1.rate, 50.5); assert.equal(cumulate([R.F3A[1]]).rateF, 66.7);
+  const row = (ps, pe, tid) => { const F = followUp(c, ps, pe, tid); return F.g1.concat(F.g2).find(r => r.id === 'F3A'); };
+  const T1 = row('2026-09-07', '2026-11-27'); assert.equal(T1.ev, 103, '1er trimestre = séquences 1 + 2 (remédiation de la séquence 2 rendue après la fin du trimestre)'); assert.equal(T1.ok, 52); assert.equal(T1.eff, 58, 'effectif = élèves de la classe saisis');
+  const S1 = row('2026-10-12', '2026-10-16'); assert.equal(S1.ev, 53); assert.equal(S1.ok, 32); assert.equal(S1.rateOk, 60.4, 'une seule séquence : la séquence 1');
+  const empty = row('2027-01-04', '2027-01-29'); assert.equal(empty.hasEv, 0, 'pas encore de résultats : cases vides');
+  assert.ok(followUp(c, '2026-09-07', '2026-11-27', 'K').n >= 1, 'fiche personnelle d’un enseignant');
+  assert.equal(evalWeekOf(c, '2026-11-24').seq, 2, 'semaine harmonisée de la séquence 2 (calendrier par défaut 2026/2027)');
+  const S = stats(c, 'K', '2026-10-01', '2026-12-01'); assert.equal(S.lessonsDone, 0); assert.equal(S.assessH, 6, 'évaluation et remédiations : heures comptées, aucune leçon');
+});

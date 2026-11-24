@@ -1,0 +1,486 @@
+// Moteur de calcul Rekort : heures dues / faites, leçons attendues (rythme), retards, périodes, fiche d'inspection.
+// Fonctions pures : aucune dépendance à l'écran. `state` = { dept, teachers, classes, assign, regul, entries }.
+import { dow, eachDay, addDays, minISO, maxISO, diffDays, mondayOf, monthStart, monthEnd, addMonths, todayISO, endFor, timeToMin } from './dates.js';
+import { reasonOf, isLessonType, THRESHOLDS } from './consts.js';
+import { seqResults, cumulate, evalWeeks } from './progress.js';
+
+export const r1 = (x) => Math.round(x * 10) / 10;
+export const pct = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : 0);
+
+/* ---------- contexte (index et calendrier) ---------- */
+export function makeCtx(state, today = todayISO()) {
+  const dept = state.dept || {};
+  const terms = (dept.terms || []).filter(t => t.start && t.end).map(t => ({ ...t, last: t.end })).sort((a, b) => (a.start < b.start ? -1 : 1));
+  const off = new Set();
+  for (const r of dept.calendar || []) if (r.f) eachDay(r.f, r.t || r.f).forEach(d => off.add(d));
+  const teachers = (state.teachers || []).filter(t => !t.deleted);
+  const classes = (state.classes || []).filter(c => !c.deleted);
+  const assign = (state.assign || []).filter(a => !a.deleted);
+  const regul = (state.regul || []).filter(r => !r.deleted);
+  const entries = (state.entries || []).filter(e => !e.deleted);
+  const byTeacher = {}, abs = {}, absSlot = {};
+  for (const e of entries) {
+    (byTeacher[e.teacherId] = byTeacher[e.teacherId] || []).push(e);
+    if (e.type === 'absence' && e.date) {
+      if (e.classId) (absSlot[e.teacherId] = absSlot[e.teacherId] || {})[e.date + '|' + e.classId] = e.reason || 'unknown';   // absent à un cours précis
+      else (abs[e.teacherId] = abs[e.teacherId] || {})[e.date] = e.reason || 'other';   // jour entier
+    }
+  }
+  const ys = terms.length ? terms[0].start : today;
+  const ye = terms.length ? terms[terms.length - 1].last : today;
+  const ctx = {
+    dept, terms, off, teachers, classes, assign, regul, entries, byTeacher, abs, absSlot, today, ys, ye, lh: +dept.lh || 2,
+    teacher: (id) => teachers.find(t => t.id === id),
+    cls: (id) => classes.find(c => c.id === id),
+    termOf: (iso) => (terms.find(t => iso >= t.start && iso <= t.end) || {}).id || '',
+    inWindow: (iso) => terms.some(t => iso >= t.start && iso <= t.last),
+    reasonOut: (id) => (dept.dueOut && dept.dueOut[id] != null ? !!dept.dueOut[id] : reasonOf(id).out),
+    _day: new Map(), _year: new Map(),
+  };
+  ctx.isTeaching = (iso) => dow(iso) !== 0 && ctx.inWindow(iso) && !off.has(iso);
+  return ctx;
+}
+
+/* heures prévues par l'emploi du temps un jour donné : { classId: heures } */
+function slotsOn(ctx, tid, iso) {
+  const key = tid + '|' + iso;
+  if (ctx._day.has(key)) return ctx._day.get(key);
+  const t = ctx.teacher(tid), res = {}; let total = 0;
+  const d = dow(iso), term = ctx.termOf(iso);
+  for (const s of (t && t.slots) || []) {
+    if (+s.d !== d) continue;
+    if (s.tm && term && s.tm !== term) continue;
+    if (s.only && s.only.length && !s.only.includes(iso)) continue;
+    res[s.c] = (res[s.c] || 0) + (+s.h || 0); total += +s.h || 0;
+  }
+  const out = { byClass: res, total };
+  ctx._day.set(key, out); return out;
+}
+
+/** Heures dues d'un enseignant sur [ps, pe] (emploi du temps − jours sans cours de l'établissement − jours « excusés »). */
+export function dueRange(ctx, tid, ps, pe) {
+  const out = { due: 0, excused: 0, absent: 0, closed: 0, byClass: {}, declared: [] };
+  for (const iso of eachDay(ps, pe)) {
+    if (dow(iso) === 0) continue;
+    const { byClass, total } = slotsOn(ctx, tid, iso); if (!total) continue;
+    if (!ctx.isTeaching(iso)) { if (ctx.inWindow(iso) && ctx.off.has(iso)) out.closed += total; continue; }
+    const reason = (ctx.abs[tid] || {})[iso];
+    if (reason && ctx.reasonOut(reason)) { out.excused += total; out.declared.push({ date: iso, reason, h: total, out: true }); continue; }
+    out.due += total; for (const c in byClass) out.byClass[c] = (out.byClass[c] || 0) + byClass[c];
+    if (reason) { out.absent += total; out.declared.push({ date: iso, reason, h: total, out: false }); continue; }
+    const sa = ctx.absSlot[tid];
+    if (sa) for (const c in byClass) {
+      const r = sa[iso + '|' + c]; if (!r) continue;
+      if (ctx.reasonOut(r)) { out.excused += byClass[c]; out.due -= byClass[c]; out.byClass[c] -= byClass[c]; out.declared.push({ date: iso, reason: r, h: byClass[c], out: true }); }
+      else { out.absent += byClass[c]; out.declared.push({ date: iso, reason: r, h: byClass[c], out: false }); }
+    }
+  }
+  return out;
+}
+function yearDue(ctx, tid) {
+  if (!ctx._year.has(tid)) ctx._year.set(tid, dueRange(ctx, tid, ctx.ys, ctx.ye));
+  return ctx._year.get(tid);
+}
+
+/** Part (0..1) d'une régularisation dans [ps,pe] (répartie sur sa plage de dates). */
+function regulShare(r, ps, pe) {
+  if (!r.d) return 0;
+  const w1 = r.d, w2 = r.d2 && r.d2 > r.d ? r.d2 : r.d;
+  const o1 = maxISO(w1, ps), o2 = minISO(w2, pe);
+  return o2 < o1 ? 0 : (diffDays(o1, o2) + 1) / (diffDays(w1, w2) + 1);
+}
+
+/* ---------- ce que l'enseignant a saisi ---------- */
+export function doneRange(ctx, tid, ps, pe) {
+  const out = { hours: 0, lessons: new Set(), theory: new Set(), practical: new Set(), further: new Set(), revisionH: 0, orientationH: 0, assessH: 0, digital: 0, evaluated: 0, passed: 0, byClass: {}, count: 0 };
+  for (const e of ctx.byTeacher[tid] || []) {
+    if (e.type === 'absence' || !e.date || e.date < ps || e.date > pe) continue;
+    const h = (+e.minutes || 0) / 60; out.hours += h; out.count++;
+    if (e.classId) { const b = (out.byClass[e.classId] = out.byClass[e.classId] || { hours: 0, theory: new Set(), practical: new Set() }); b.hours += h; if (e.type === 'lesson' && e.n != null && e.done !== false) b.theory.add(e.n); if (e.type === 'practical') b.practical.add(e.n != null ? e.n : e.id); }
+    if (e.type === 'lesson' && e.n != null) { if (e.done !== false) { out.lessons.add(e.classId + '|L|' + e.n); out.theory.add(e.classId + '|' + e.n); } }   // leçon « en cours » : heures comptées, leçon pas encore
+    else if (e.type === 'practical') out.practical.add(e.classId + '|' + (e.n != null ? e.n : e.id));   // TP : comptés à part, jamais dans les leçons
+    else if (e.type === 'further') out.further.add(e.classId + '|' + (e.n != null ? e.n : e.id));       // further study / travail guidé : à part aussi
+    else if (e.type === 'revision') out.revisionH += h;
+    else if (e.type === 'orientation') out.orientationH += h;
+    else if (e.type === 'assessment' || e.type === 'correction') out.assessH += h;   // évaluations et corrections : heures comptées, jamais des leçons
+    if (e.digital) out.digital++;
+    if (e.eval) { out.evaluated += +e.eval.evaluated || 0; out.passed += +e.eval.passed || 0; }
+  }
+  return out;
+}
+
+/* ---------- rythme des leçons ---------- */
+/** Leçons attendues pour une affectation (enseignant × classe) sur [ps,pe], proportionnellement aux heures de cours de la période. */
+function expectedLessons(ctx, a, ps, pe, dueCache) {
+  const total = +a.th || 0; if (!total) return 0;   // le rythme des leçons ne compte que les leçons (théorie)
+  const yr = yearDue(ctx, a.teacherId).byClass[a.classId] || 0; if (!yr) return 0;
+  const part = (dueCache || dueRange(ctx, a.teacherId, ps, pe)).byClass[a.classId] || 0;
+  return total * part / yr;
+}
+export function lagStatus(lag) { return lag <= -1.5 ? 'ahead' : lag <= 1 ? 'ok' : lag <= 3 ? 'slight' : 'late'; }
+
+/** Avancement de chaque affectation d'un enseignant à une date (depuis la rentrée). */
+export function classProgress(ctx, tid, asOf = ctx.today) {
+  const cut = minISO(asOf, ctx.ye), due = dueRange(ctx, tid, ctx.ys, cut), done = doneRange(ctx, tid, ctx.ys, cut);
+  const rows = [];
+  const mine = ctx.assign.filter(a => a.teacherId === tid);
+  const classIds = new Set([...mine.map(a => a.classId), ...Object.keys(done.byClass)]);
+  for (const cid of classIds) {
+    const a = mine.find(x => x.classId === cid) || { teacherId: tid, classId: cid, th: 0, pr: 0, hours: 0 };
+    const cls = ctx.cls(cid); const d = done.byClass[cid] || { hours: 0, theory: new Set(), practical: new Set() };
+    const exp = expectedLessons(ctx, a, ctx.ys, cut, due);
+    let rl = 0, rh = 0; for (const r of ctx.regul) if (r.teacherId === tid && r.classId === cid) { const sh = regulShare(r, ctx.ys, cut); rl += (+r.lessons || 0) * sh; rh += (+r.h || 0) * sh; }
+    const doneL = d.theory.size + rl, total = +a.th || 0;
+    const lag = r1(exp - doneL);
+    rows.push({ classId: cid, name: cls ? cls.name : cid, plan: { th: +a.th || 0, pr: +a.pr || 0, hours: +a.hours || 0, total }, doneTh: d.theory.size, doneTP: d.practical.size, done: doneL,
+      expected: r1(exp), lag, status: total ? lagStatus(lag) : 'none', hours: r1(d.hours + rh), hoursDue: r1(due.byClass[cid] || 0), progress: total ? pct(doneL, total) : 0, expectedPct: total ? pct(exp, total) : 0 });
+  }
+  return rows.sort((x, y) => (x.name < y.name ? -1 : 1));
+}
+
+/* ---------- statistiques d'une période ---------- */
+function emptyStats(ps, pe, cut) {
+  return { ps, pe, cut, dueFull: 0, due: 0, excused: 0, absent: 0, closed: 0, hours: 0, regul: 0, lessonsDone: 0, regulL: 0, theory: 0, practical: 0, lessonsPlanned: 0, lessonsFull: 0, planned: false, revisionH: 0, orientationH: 0, assessH: 0,
+    digital: 0, evaluated: 0, passed: 0, entries: 0, planYear: { hours: 0, lessons: 0 }, declared: [] };
+}
+function teacherStats(ctx, tid, ps, pe) {
+  const cut = minISO(pe, ctx.today);
+  const full = dueRange(ctx, tid, ps, pe), now = pe > cut ? dueRange(ctx, tid, ps, cut) : full;
+  const done = doneRange(ctx, tid, ps, pe);
+  const S = emptyStats(ps, pe, cut);
+  let regul = 0, regulL = 0; for (const r of ctx.regul) if (r.teacherId === tid) { const sh = regulShare(r, ps, pe); regul += (+r.h || 0) * sh; regulL += (+r.lessons || 0) * sh; }
+  S.dueFull = full.due; S.due = now.due; S.excused = full.excused; S.absent = full.absent; S.closed = full.closed; S.declared = full.declared;
+  S.regul = regul; S.hours = done.hours + regul; S.entries = done.count;
+  S.regulL = regulL; S.lessonsDone = done.lessons.size + regulL; S.theory = done.theory.size; S.practical = done.practical.size;
+  S.revisionH = done.revisionH; S.orientationH = done.orientationH; S.assessH = done.assessH; S.digital = done.digital; S.evaluated = done.evaluated; S.passed = done.passed;
+  const mine = ctx.assign.filter(a => a.teacherId === tid);
+  if (mine.length) { S.planned = true; for (const a of mine) { S.lessonsPlanned += expectedLessons(ctx, a, ps, cut, now); S.lessonsFull += expectedLessons(ctx, a, ps, pe, full); } }
+  else { S.lessonsPlanned = now.due / ctx.lh; S.lessonsFull = full.due / ctx.lh; }
+  const yd = yearDue(ctx, tid);
+  S.planYear.hours = mine.reduce((s, a) => s + (+a.hours || 0), 0) || yd.due;
+  S.planYear.lessons = mine.reduce((s, a) => s + (+a.th || 0), 0) || yd.due / ctx.lh;
+  S.practicalPlanned = mine.reduce((s, a) => s + (+a.pr || 0), 0); S.further = done.further.size;
+  return S;
+}
+const SUM = ['dueFull', 'due', 'excused', 'absent', 'closed', 'hours', 'regul', 'regulL', 'lessonsDone', 'theory', 'practical', 'practicalPlanned', 'further', 'lessonsPlanned', 'lessonsFull', 'revisionH', 'orientationH', 'assessH', 'digital', 'evaluated', 'passed', 'entries'];
+
+/** Statistiques sur [ps,pe] pour un enseignant (tid) ou pour tout le département (tid = null). */
+export function stats(ctx, tid, ps, pe) {
+  let S;
+  if (tid) S = teacherStats(ctx, tid, ps, pe);
+  else {
+    S = emptyStats(ps, pe, minISO(pe, ctx.today));
+    for (const t of ctx.teachers) {
+      const x = teacherStats(ctx, t.id, ps, pe);
+      for (const k of SUM) S[k] += x[k];
+      S.planned = S.planned || x.planned; S.planYear.hours += x.planYear.hours; S.planYear.lessons += x.planYear.lessons; S.declared = S.declared.concat(x.declared.map(d => ({ ...d, teacherId: t.id })));
+    }
+  }
+  for (const k of ['hours', 'due', 'dueFull', 'lessonsPlanned', 'lessonsFull', 'lessonsDone', 'excused', 'absent', 'closed', 'revisionH', 'orientationH', 'assessH', 'regul', 'regulL']) S[k] = r1(S[k]);
+  S.gap = r1(S.hours - S.due); S.rate = pct(S.hours, S.due);
+  S.lessonGap = r1(S.lessonsDone - S.lessonsPlanned); S.rateL = pct(S.lessonsDone, S.lessonsPlanned);
+  S.rateYH = pct(S.hours, S.planYear.hours); S.rateYL = pct(S.lessonsDone, S.planYear.lessons);
+  S.successRate = S.evaluated ? pct(S.passed, S.evaluated) : null;
+  S.alerts = [];
+  if (S.due > 0 && S.rate < THRESHOLDS.hours) S.alerts.push({ kind: 'hours', value: S.rate, threshold: THRESHOLDS.hours });
+  if (S.lessonsPlanned > 0 && S.rateL < THRESHOLDS.lessons) S.alerts.push({ kind: 'lessons', value: S.rateL, threshold: THRESHOLDS.lessons });
+  if (S.successRate != null && S.successRate < THRESHOLDS.success) S.alerts.push({ kind: 'success', value: S.successRate, threshold: THRESHOLDS.success });
+  return S;
+}
+
+/** État global en un mot (pour une pastille) : fondé sur les taux, donc valable pour un enseignant comme pour tout le département. */
+/** Collègues sans emploi du temps : leurs heures dues sont inconnues, donc tout pourcentage d'heures serait faux. */
+export function noTimetable(ctx, tid) {
+  const list = tid ? [ctx.teacher(tid)].filter(Boolean) : ctx.teachers;
+  return list.filter(x => !(x.slots || []).some(sl => +sl.h > 0));
+}
+
+export function overall(S) {
+  if (!S.due && !S.lessonsPlanned) return 'none';
+  const hasL = S.lessonsPlanned >= 1;
+  if ((S.due > 0 && S.rate < THRESHOLDS.hours) || (hasL && S.rateL < THRESHOLDS.lessons)) return 'late';
+  const worst = Math.min(S.due ? S.rate : 100, hasL ? S.rateL : 100);
+  if (worst < 90) return 'slight';
+  if (hasL && S.rateL >= 110 && (!S.due || S.rate >= 100)) return 'ahead';
+  return 'ok';
+}
+
+/* ---------- périodes ---------- */
+export function periodOf(ctx, kind, anchor, custom) {
+  const a = anchor || ctx.today;
+  if (kind === 'week') { const ps = mondayOf(a); return { kind, ps, pe: addDays(ps, 5) }; }
+  if (kind === 'month') return { kind, ps: monthStart(a), pe: monthEnd(a) };
+  if (kind === 'term') {
+    const t = ctx.terms.find(x => a >= x.start && a <= x.end) || ctx.terms.slice().reverse().find(x => x.start <= a) || ctx.terms[0];
+    return t ? { kind, ps: t.start, pe: t.end, term: t.id } : { kind: 'year', ps: ctx.ys, pe: ctx.ye };
+  }
+  if (kind === 'custom') return { kind, ps: (custom && custom.ps) || ctx.ys, pe: (custom && custom.pe) || ctx.today };
+  return { kind: 'year', ps: ctx.ys, pe: ctx.ye };
+}
+export function shiftPeriod(ctx, p, dir) {
+  if (p.kind === 'week') return periodOf(ctx, 'week', addDays(p.ps, 7 * dir));
+  if (p.kind === 'month') return periodOf(ctx, 'month', addMonths(p.ps, dir));
+  if (p.kind === 'term') {
+    const i = ctx.terms.findIndex(t => t.id === p.term), j = Math.min(ctx.terms.length - 1, Math.max(0, i + dir));
+    return ctx.terms[j] ? { kind: 'term', ps: ctx.terms[j].start, pe: ctx.terms[j].end, term: ctx.terms[j].id } : p;
+  }
+  return p;
+}
+
+/* ---------- séries pour les graphiques ---------- */
+export function series(ctx, tid, ps, pe, unit = 'week') {
+  const buckets = [];
+  if (unit === 'day') { for (const d of eachDay(ps, pe)) if (dow(d) !== 0) buckets.push({ key: d, ps: d, pe: d }); }
+  else if (unit === 'month') { for (let m = monthStart(ps); m <= pe; m = addMonths(m, 1)) buckets.push({ key: m.slice(0, 7), ps: maxISO(m, ps), pe: minISO(monthEnd(m), pe) }); }
+  else { for (let w = mondayOf(ps); w <= pe; w = addDays(w, 7)) buckets.push({ key: w, ps: maxISO(w, ps), pe: minISO(addDays(w, 6), pe) }); }
+  return buckets.map(b => {
+    const ids = tid ? [tid] : ctx.teachers.map(t => t.id); let due = 0, done = 0;
+    for (const id of ids) { due += dueRange(ctx, id, b.ps, b.pe).due; done += doneRange(ctx, id, b.ps, b.pe).hours; }
+    return { ...b, due: r1(due), done: r1(done), future: b.ps > ctx.today };
+  });
+}
+
+/* ---------- aujourd'hui ---------- */
+export function todaySlots(ctx, tid, iso = ctx.today) {
+  const { byClass } = slotsOn(ctx, tid, iso); const reason = (ctx.abs[tid] || {})[iso];
+  const mine = (ctx.byTeacher[tid] || []).filter(e => e.date === iso && e.type !== 'absence');
+  const t = ctx.teacher(tid); const rows = [];
+  if (!ctx.isTeaching(iso)) return { rows, teaching: false, off: ctx.off.has(iso), reason, entries: mine };
+  for (const s of (t && t.slots) || []) {
+    if (+s.d !== dow(iso) || (s.tm && ctx.termOf(iso) && s.tm !== ctx.termOf(iso)) || (s.only && s.only.length && !s.only.includes(iso))) continue;
+    const done = mine.some(e => e.classId === s.c), sa = (ctx.absSlot[tid] || {})[iso + '|' + s.c];
+    rows.push({ c: s.c, h: +s.h || 0, st: s.st || '', en: s.en || (s.st ? endFor(s.st, s.h, ctx.dept.breaks, ctx.dept.period) : ''), done, absent: done ? '' : sa || '' });
+  }
+  rows.sort((a, b) => (a.st < b.st ? -1 : a.st > b.st ? 1 : 0));
+  return { rows, teaching: true, off: false, reason, entries: mine, hours: Object.values(byClass).reduce((a, b) => a + b, 0) };
+}
+/** Deux séances d'une même classe se chevauchent-elles (même jour) ? */
+export const overlaps = (a, b) => { const a1 = timeToMin(a.start), a2 = timeToMin(a.end), b1 = timeToMin(b.start), b2 = timeToMin(b.end); return !(isNaN(a1) || isNaN(a2) || isNaN(b1) || isNaN(b2)) && a1 < b2 && b1 < a2; };
+/** Séances déjà saisies par ce collègue, ce jour, dans cette classe, qui chevauchent `cand` (doublons probables). */
+export function duplicates(ctx, tid, cand) {
+  return (ctx.byTeacher[tid] || []).filter(e => e.type !== 'absence' && e.id !== cand.id && e.date === cand.date && e.classId === cand.classId && overlaps(e, cand));
+}
+/** Remarques sur une séance en cours de saisie : classe ou jour absent de l'emploi du temps, doublon. Rien de bloquant. */
+export function checkEntry(ctx, tid, cand) {
+  const out = [], tc = ctx.teacher(tid);
+  if (cand.classId && cand.date && tc && (tc.slots || []).length) {
+    const td = todaySlots(ctx, tid, cand.date);
+    if (!td.teaching) out.push({ kind: 'noday' });
+    else if (!td.rows.some(r => r.c === cand.classId)) out.push({ kind: 'noslot', rows: td.rows });
+  }
+  const dup = cand.classId && cand.date ? duplicates(ctx, tid, cand) : [];
+  if (dup.length) out.push({ kind: 'dup', entry: dup[0] });
+  return out;
+}
+
+/** Ce qui manque (cours prévus ni saisis ni excusés, depuis la rentrée) et ce qui est à vérifier (saisies hors emploi du temps, doublons). `tid` null = tout le département. */
+export function gapReport(ctx, tid) {
+  const ids = tid ? [tid] : ctx.teachers.map(x => x.id), from = ctx.ys, to = minISO(ctx.today, ctx.ye), missing = [], flagged = [], noTT = [];
+  for (const id of ids) {
+    const tc = ctx.teacher(id); if (!tc) continue;
+    if (!(tc.slots || []).some(sl => +sl.h > 0)) { noTT.push(tc); continue; }
+    for (const iso of eachDay(from, to)) {
+      if (dow(iso) === 0) continue;
+      const td = todaySlots(ctx, id, iso); if (!td.teaching || td.reason) continue;
+      for (const row of td.rows) if (!row.done && !row.absent) missing.push({ iso, tid: id, row });
+    }
+  }
+  for (const id of ids) for (const e of ctx.byTeacher[id] || []) {
+    if (e.type === 'absence' || !e.date || e.date < from || e.date > to) continue;
+    const kinds = checkEntry(ctx, id, e).map(k => k.kind); if (kinds.length) flagged.push({ e, kinds });
+  }
+  missing.sort((a, b) => (a.iso < b.iso ? 1 : a.iso > b.iso ? -1 : a.row.st < b.row.st ? -1 : 1));
+  flagged.sort((a, b) => (a.e.date < b.e.date ? 1 : -1));
+  return { missing, flagged, noTT, hours: r1(missing.reduce((s, m) => s + m.row.h, 0)) };
+}
+
+/* ---------- objectifs cumulés : où en est-on, par rapport à la cible, à une date donnée ---------- */
+/** Objectif et réalisé cumulés depuis la rentrée jusqu'à `cut`, en leçons et en heures. `tid` null = département ; `classId` facultatif. */
+export function progressAt(ctx, tid, classId, cut) {
+  const ids = tid ? [tid] : ctx.teachers.map(x => x.id), c = minISO(cut, ctx.ye), out = { goalL: 0, doneL: 0, goalH: 0, doneH: 0 };
+  for (const id of ids) {
+    const due = dueRange(ctx, id, ctx.ys, c), done = doneRange(ctx, id, ctx.ys, c);
+    for (const a of ctx.assign.filter(x => x.teacherId === id && (!classId || x.classId === classId))) out.goalL += expectedLessons(ctx, a, ctx.ys, c, due);
+    if (classId) { const b = done.byClass[classId]; if (b) { out.doneL += b.theory.size; out.doneH += b.hours; } out.goalH += due.byClass[classId] || 0; }
+    else { out.doneL += done.lessons.size; out.doneH += done.hours; out.goalH += due.due; }
+    for (const r of ctx.regul) if (r.teacherId === id && (!classId || r.classId === classId)) { const sh = regulShare(r, ctx.ys, c); out.doneL += (+r.lessons || 0) * sh; out.doneH += (+r.h || 0) * sh; }
+  }
+  return { goalL: r1(out.goalL), doneL: r1(out.doneL), goalH: r1(out.goalH), doneH: r1(out.doneH) };
+}
+
+/** Une ligne par semaine de l'année : l'objectif cumulé reste affiché jusqu'en fin d'année, le réalisé s'arrête à aujourd'hui. */
+export function cumulative(ctx, tid, classId) {
+  const rows = []; let k = 0;
+  for (let w = mondayOf(ctx.ys); w <= ctx.ye; w = addDays(w, 7)) {
+    const end = minISO(addDays(w, 5), ctx.ye), future = w > ctx.today; k++;
+    const p = progressAt(ctx, tid, classId, end), n = future ? null : progressAt(ctx, tid, classId, minISO(end, ctx.today));
+    rows.push({ k, ps: w, pe: end, future, goalL: p.goalL, goalH: p.goalH, doneL: n ? n.doneL : null, doneH: n ? n.doneH : null });
+  }
+  return rows;
+}
+
+/** Même chose à la fin de chaque trimestre. */
+export function byTerm(ctx, tid, classId) {
+  return ctx.terms.map(tm => { const g = progressAt(ctx, tid, classId, tm.end), n = progressAt(ctx, tid, classId, minISO(tm.end, ctx.today)), future = tm.start > ctx.today;
+    return { id: tm.id, name: tm.name, end: tm.end, future, goalL: g.goalL, goalH: g.goalH, doneL: future ? null : n.doneL, doneH: future ? null : n.doneH }; });
+}
+
+/** Activité d'un collègue dans l'application : semaines où il a saisi, classes saisies, dernière saisie. */
+export function activity(ctx, tid) {
+  const tc = ctx.teacher(tid), es = (ctx.byTeacher[tid] || []).filter(e => e.type !== 'absence' && e.date <= ctx.today);
+  const hasTT = tc && (tc.slots || []).some(sl => +sl.h > 0), weeks = new Set(), active = new Set(es.map(e => mondayOf(e.date)));
+  for (let w = mondayOf(ctx.ys); w <= ctx.today; w = addDays(w, 7)) {
+    if (!hasTT || dueRange(ctx, tid, maxISO(w, ctx.ys), minISO(addDays(w, 5), ctx.today)).due > 0) weeks.add(w);
+  }
+  const done = [...weeks].filter(w => active.has(w)).length, classes = new Set([...ctx.assign.filter(a => a.teacherId === tid).map(a => a.classId), ...((tc && tc.slots) || []).map(sl => sl.c)]);
+  const filled = [...classes].filter(c => es.some(e => e.classId === c)).length, last = es.map(e => e.date).sort().pop() || '';
+  const rate = weeks.size ? done / weeks.size : 0;
+  return { weeks: weeks.size, active: done, classes: classes.size, filled, last, since: last ? diffDays(last, ctx.today) : null, lessons: es.filter(e => e.n != null).length, level: !weeks.size ? 'none' : (!last || diffDays(last, ctx.today) >= 14) ? 'inactive' : rate >= 0.8 ? 'regular' : rate >= 0.4 ? 'irregular' : 'low', rate: Math.round(rate * 100) };
+}
+
+export function nextNumber(ctx, tid, classId, type) {
+  let max = 0;
+  for (const e of ctx.byTeacher[tid] || []) if (e.classId === classId && e.type === type && e.n != null && e.n > max) max = e.n;
+  const a = ctx.assign.find(x => x.teacherId === tid && x.classId === classId);   // programme repris en cours d'année : on commence à la leçon indiquée
+  if (!max && a && +a.n0 > 1 && type === 'lesson') return +a.n0;
+  return max + 1;
+}
+
+/* ---------- facteurs d'écart (données structurées, mises en phrases par l'interface) ---------- */
+export function factors(ctx, S) {
+  const out = [];
+  const byReason = {};
+  for (const d of S.declared) if (!d.out) { const k = d.reason; (byReason[k] = byReason[k] || {}); const who = d.teacherId || '_'; byReason[k][who] = (byReason[k][who] || 0) + d.h; }
+  for (const k in byReason) out.push({ kind: 'absence', reason: k, who: Object.entries(byReason[k]).map(([id, h]) => ({ teacher: id === '_' ? null : (ctx.teacher(id) || {}).short || id, h: r1(h) })) });
+  if (S.closed > 0) out.push({ kind: 'closed', h: S.closed });
+  if (S.excused > 0) out.push({ kind: 'excused', h: S.excused });
+  if (S.revisionH > 0) out.push({ kind: 'revision', h: S.revisionH });
+  if (S.assessH > 0) out.push({ kind: 'assessment', h: S.assessH });
+  if (S.regul) out.push({ kind: 'regul', h: S.regul });
+  return out;
+}
+
+/* ---------- récapitulatif par classe ---------- */
+export function recap(ctx, ps, pe) {
+  const rows = ctx.classes.map(c => {
+    const A = ctx.assign.filter(a => a.classId === c.id);
+    let hours = 0, th = new Set(), pr = new Set(), digital = 0, hoursDue = 0;
+    for (const t of ctx.teachers) {
+      for (const e of ctx.byTeacher[t.id] || []) {
+        if (e.classId !== c.id || e.type === 'absence' || !e.date || e.date < ps || e.date > pe) continue;
+        hours += (+e.minutes || 0) / 60; if (e.digital) digital++;
+        if (e.type === 'lesson' && e.n != null && e.done !== false) th.add(t.id + '|' + e.n); if (e.type === 'practical') pr.add(t.id + '|' + (e.n != null ? e.n : e.id));
+      }
+      hoursDue += dueRange(ctx, t.id, ps, minISO(pe, ctx.today)).byClass[c.id] || 0;
+    }
+    const planTh = A.reduce((s, a) => s + (+a.th || 0), 0), planPr = A.reduce((s, a) => s + (+a.pr || 0), 0), planH = A.reduce((s, a) => s + (+a.hours || 0), 0);
+    return { id: c.id, name: c.name, cycle: c.cycle, effectif: c.effectif || {}, planTh, planPr, planH, hours: r1(hours), hoursDue: r1(hoursDue), th: th.size, pr: pr.size, digital,
+      rateH: pct(hours, planH || hoursDue), rateTh: pct(th.size, planTh), ratePr: pct(pr.size, planPr) };
+  });
+  const tot = (list) => list.reduce((a, r) => ({ planTh: a.planTh + r.planTh, planPr: a.planPr + r.planPr, planH: a.planH + r.planH, hours: a.hours + r.hours, th: a.th + r.th, pr: a.pr + r.pr, digital: a.digital + r.digital, total: a.total + (+r.effectif.total || 0) }), { planTh: 0, planPr: 0, planH: 0, hours: 0, th: 0, pr: 0, digital: 0, total: 0 });
+  const g1 = rows.filter(r => r.cycle !== '2nd'), g2 = rows.filter(r => r.cycle === '2nd');
+  const wrap = (list) => { const t = tot(list); return { ...t, hours: r1(t.hours), rateH: pct(t.hours, t.planH), rateTh: pct(t.th, t.planTh), ratePr: pct(t.pr, t.planPr) }; };
+  return { rows, g1, g2, t1: wrap(g1), t2: wrap(g2), total: wrap(rows) };
+}
+
+/* ---------- couverture « prévu / fait » par enseignant × classe (accueil ET fiche de suivi : une seule règle) ---------- */
+/** Pour chaque enseignant × classe sur [ps,pe] :
+ *  - leçons prévues = part du programme de la classe qui revient à la période (réparties selon les heures de cours ; arrondies de façon que les trimestres s'additionnent exactement au programme de l'année) ;
+ *  - heures prévues = heures dues par l'emploi du temps sur toute la période ;
+ *  - « faites » = ce qui est saisi (régularisations comprises), PLAFONNÉ au prévu : une classe ne dépasse jamais 100 % ; `rawL`/`rawH` gardent le brut pour signaler un dépassement. */
+export function coverCells(ctx, ps, pe, tid = null) {
+  const cells = [], prev = addDays(ps, -1);
+  for (const t of ctx.teachers) {
+    if (tid && t.id !== tid) continue;
+    const full = dueRange(ctx, t.id, ps, pe), done = doneRange(ctx, t.id, ps, pe), yr = yearDue(ctx, t.id).byClass;
+    const mine = ctx.assign.filter(a => a.teacherId === t.id);
+    const cum = (a, d) => { if (d < ctx.ys) return 0; const y = yr[a.classId] || 0; return y ? Math.round((+a.th || 0) * (dueRange(ctx, t.id, ctx.ys, minISO(d, ctx.ye)).byClass[a.classId] || 0) / y) : 0; };
+    for (const cid of new Set([...mine.map(a => a.classId), ...Object.keys(full.byClass), ...Object.keys(done.byClass)])) {
+      if (!ctx.cls(cid)) continue;
+      const a = mine.find(x => x.classId === cid), d = done.byClass[cid] || { hours: 0, theory: new Set() };
+      let rl = 0, rh = 0; for (const r of ctx.regul) if (r.teacherId === t.id && r.classId === cid) { const sh = regulShare(r, ps, pe); rl += (+r.lessons || 0) * sh; rh += (+r.h || 0) * sh; }
+      const planL = a ? Math.max(0, cum(a, minISO(pe, ctx.ye)) - cum(a, prev)) : 0, planH = full.byClass[cid] || 0, rawL = d.theory.size + rl, rawH = d.hours + rh;
+      cells.push({ tid: t.id, cid, planL, rawL, doneL: Math.min(rawL, planL), planH, rawH, doneH: Math.min(rawH, planH) });
+    }
+  }
+  return cells;
+}
+const sumCells = (list) => { const o = list.reduce((a, c) => ({ planL: a.planL + c.planL, doneL: a.doneL + c.doneL, rawL: a.rawL + c.rawL, planH: a.planH + c.planH, doneH: a.doneH + c.doneH, rawH: a.rawH + c.rawH }), { planL: 0, doneL: 0, rawL: 0, planH: 0, doneH: 0, rawH: 0 }); return { ...o, rateL: pct(o.doneL, o.planL), rateH: pct(o.doneH, o.planH) }; };
+/** Totaux de couverture (accueil) sur [ps,pe], pour un enseignant ou pour tout le département. */
+export function coverTotals(ctx, ps, pe, tid = null) { return sumCells(coverCells(ctx, ps, pe, tid)); }
+
+/** Fiche pédagogique de suivi (censorat / délégation) : une ligne par classe, sur la période demandée (trimestre, année…).
+ *  Leçons et heures : « prévu » et « fait » de coverCells, donc jamais plus de 100 % par classe, et les totaux sont les mêmes que sur l'accueil. */
+export function followUp(ctx, ps, pe, tid = null) {
+  // tid : fiche personnelle d'un enseignant (ses classes, ses heures, ses leçons) ; sans tid : tout le département (somme des fiches de chacun)
+  const cells = coverCells(ctx, ps, pe, tid), byClass = {}, SEQ = seqResults(ctx), wk = evalWeeks(ctx);
+  // séquences de la période : celles dont la semaine d'évaluation tombe dans la période (la remédiation peut venir après) ; à défaut, la date de la saisie
+  const inPeriod = (q, r) => { const w = wk.find(x => +x.seq === +q); return w ? w.f <= pe && (w.t || w.f) >= ps : r.date >= ps && r.date <= pe; };
+  for (const c of cells) (byClass[c.cid] = byClass[c.cid] || []).push(c);
+  const mineCls = tid ? new Set([...ctx.assign.filter(a => a.teacherId === tid).map(a => a.classId), ...cells.filter(x => x.rawL || x.rawH || x.planH).map(x => x.cid)]) : null;
+  const rows = ctx.classes.filter(c => !mineCls || mineCls.has(c.id)).map(c => {
+    const A = ctx.assign.filter(a => a.classId === c.id && (!tid || a.teacherId === tid)), cc = sumCells(byClass[c.id] || []), ids = tid ? new Set([tid]) : new Set([...A.map(a => a.teacherId), ...(byClass[c.id] || []).filter(x => x.rawL || x.rawH).map(x => x.tid)]);
+    const pr = new Set(); let digital = 0, lastEval = null;
+    for (const t of ctx.teachers) { if (tid && t.id !== tid) continue; for (const e of ctx.byTeacher[t.id] || []) {
+      if (e.classId !== c.id || e.type === 'absence' || !e.date || e.date < ctx.ys || e.date > pe) continue;
+      if (e.digital) digital++; if (e.type === 'practical') pr.add(t.id + '|' + (e.n != null ? e.n : e.id));
+      if (e.date >= ps && !e.res && e.eval && +e.eval.evaluated > 0 && (!lastEval || e.date >= lastEval.date)) lastEval = { date: e.date, evaluated: +e.eval.evaluated, passed: +e.eval.passed || 0 };
+    } }
+    // évaluations de la classe (même chiffres pour tous ses enseignants) : cumul des séquences de la période (trimestre = séquences 1 + 2)
+    const seqs = Object.entries(SEQ[c.id] || {}).filter(([q, r]) => inPeriod(q, r)).map(([, r]) => r), cum = cumulate(seqs);
+    const planPr = A.reduce((x, a) => x + (+a.pr || 0), 0), size = seqs.length ? Math.max(...seqs.map(r => r.cf + r.cg)) : 0, eff = size || +((c.effectif || {}).total) || 0;
+    const hasEv = seqs.length > 0 || !!lastEval;
+    const ev = seqs.length ? cum.comp : lastEval ? lastEval.evaluated : 0, ok = seqs.length ? cum.pass : lastEval ? lastEval.passed : 0, evBase = eff * Math.max(1, seqs.length);
+    return { id: c.id, name: c.name, cycle: c.cycle, teachers: [...ids].map(i => (ctx.teacher(i) || {}).short || (ctx.teacher(i) || {}).name || '').filter(Boolean),
+      planL: cc.planL, doneL: cc.doneL, rawL: cc.rawL, planH: cc.planH, doneH: cc.doneH, rawH: cc.rawH, planPr, pr: Math.min(pr.size, planPr), digital: Math.min(digital, planPr), eff, ev, ok, evBase, hasEv: hasEv ? 1 : 0, nSeq: seqs.length, remed: cum.remed };
+  });
+  const fin = (r) => ({ ...r, rateL: pct(r.doneL, r.planL), rateH: pct(r.doneH, r.planH), ratePr: pct(r.pr, r.planPr), rateDg: pct(r.digital, r.planPr), rateEv: Math.min(100, pct(r.ev, r.evBase || r.eff)), rateOk: pct(r.ok, r.ev) });
+  const KEYS = ['planL', 'doneL', 'rawL', 'planH', 'doneH', 'rawH', 'planPr', 'pr', 'digital', 'eff', 'ev', 'ok', 'evBase', 'hasEv', 'remed'];
+  const sum = (list) => fin(list.reduce((a, r) => { for (const k of KEYS) a[k] += r.hasEv || (k !== 'ev' && k !== 'ok' && k !== 'evBase') ? r[k] : 0; return a; }, Object.fromEntries(KEYS.map(k => [k, 0]))));
+  const all = rows.map(fin), g1 = all.filter(r => r.cycle !== '2nd'), g2 = all.filter(r => r.cycle === '2nd');
+  return { g1, g2, t1: sum(g1), t2: sum(g2), total: sum(all), over: all.filter(r => r.rawL > r.planL + 0.05 || r.rawH > r.planH + 0.05), n: all.length };
+}
+
+/** Outil de reprise : propose, pour chaque affectation, les heures et leçons à compter pour que tout soit « à jour » jusqu'à `date` (ce qui n'a pas déjà été saisi). */
+export function catchUp(ctx, date) {
+  const cut = minISO(date, ctx.ye), out = [];
+  for (const t of ctx.teachers) {
+    const due = dueRange(ctx, t.id, ctx.ys, cut), done = doneRange(ctx, t.id, ctx.ys, cut);
+    const mine = ctx.assign.filter(a => a.teacherId === t.id), ids = new Set([...mine.map(a => a.classId), ...Object.keys(due.byClass)]);
+    for (const cid of ids) {
+      const a = mine.find(x => x.classId === cid), d = done.byClass[cid] || { hours: 0, theory: new Set(), practical: new Set() };
+      const h = Math.max(0, (due.byClass[cid] || 0) - d.hours);
+      const exp = a ? expectedLessons(ctx, a, ctx.ys, cut, due) : 0;
+      const l = Math.max(0, Math.round(exp) - d.theory.size);
+      if (h > 0.05 || l > 0) out.push({ teacherId: t.id, classId: cid, h: r1(h), lessons: l });
+    }
+  }
+  return out;
+}
+
+/* ---------- plusieurs années ---------- */
+/** Photo de l'année en cours (configuration seulement : les saisies restent, datées, et servent à toutes les années). */
+export function yearSnapshot(data) {
+  const d = data.dept || {}, slots = {};
+  for (const t of data.teachers || []) if (!t.deleted) slots[t.id] = t.slots || [];
+  return { year: d.year || '', closed: Date.now(), lh: d.lh, period: d.period || 60, terms: d.terms || [], calendar: d.calendar || [], breaks: d.breaks, slots, assign: (data.assign || []).filter(a => !a.deleted).map(({ u, ...a }) => a) };
+}
+/** Années disponibles, de la plus récente à la plus ancienne. */
+export function yearsOf(data) { const d = data.dept || {}; return [d.year || '', ...(d.years || []).map(y => y.year)].filter((y, i, a) => y && a.indexOf(y) === i); }
+/** Les données vues comme dans l'année demandée : sa configuration archivée, toutes les saisies. */
+export function dataForYear(data, year) {
+  const d = data.dept || {}, snap = year && year !== d.year && (d.years || []).find(y => y.year === year);
+  if (!snap) return data;
+  return { ...data, dept: { ...d, year: snap.year, lh: snap.lh || d.lh, period: snap.period || 60, terms: snap.terms, calendar: snap.calendar, ...(snap.breaks ? { breaks: snap.breaks } : {}) },
+    teachers: (data.teachers || []).map(t => ({ ...t, slots: (snap.slots || {})[t.id] || [] })), assign: snap.assign || [] };
+}
+/** Comparaison année par année : taux de couverture horaire et des leçons, par trimestre et sur l'année (période entière ; pour l'année en cours, à ce jour). */
+export function compareYears(data, tid, today) {
+  return yearsOf(data).map(year => {
+    const ctx = makeCtx(dataForYear(data, year), today), rows = ctx.terms.map(tm => ({ id: tm.id, name: tm.name, ps: tm.start, pe: tm.end })).concat(ctx.terms.length ? [{ id: 'Y', name: 'Année', ps: ctx.ys, pe: ctx.ye }] : []);
+    return { year, cells: rows.map(r => {
+      const S = stats(ctx, tid, r.ps, r.pe), started = r.ps <= today;
+      return { id: r.id, name: r.name, started, hours: S.hours, dueH: S.dueFull, rateH: started ? pct(S.hours, r.pe < today ? S.dueFull : S.due) : null, lessons: S.lessonsDone, dueL: S.lessonsFull, rateL: started ? pct(S.lessonsDone, r.pe < today ? S.lessonsFull : S.lessonsPlanned) : null };
+    }) };
+  });
+}

@@ -1,0 +1,172 @@
+// Fiche de l'inspection nationale (colonnes officielles) et récapitulatif par classe, sur les dates choisies.
+import { html, useState, useEffect } from '../vendor/preact-htm.js';
+import { t, getLang } from '../i18n.js';
+import { Icon } from '../icons.js';
+import { Seg, Chip, num1 } from '../ui.js';
+import { makeCtx, stats, factors, followUp, periodOf, classProgress, coverTotals, pct } from '../calc.js';
+import { seqResults, cumulate } from '../progress.js';
+import { PeriodBar, ScopeBar, currentTid, periodLabel , viewData, YearBar } from '../widgets.js';
+import { state, setUI, isAP, myId } from '../store.js';
+import { fmt, minISO } from '../dates.js';
+import { reasonOf, THRESHOLDS } from '../consts.js';
+import { letterText, showArms } from '../letterhead.js';
+import { exportWord } from '../exports.js';
+
+const up = (s) => String(s || '').toUpperCase();
+function factorTexts(ctx, S) {
+  const out = [];
+  for (const f of factors(ctx, S)) {
+    if (f.kind === 'absence') out.push(t('Absences déclarées ({r}) : {w}.', { r: t(reasonOf(f.reason).fr).toLowerCase(), w: f.who.map(x => (x.teacher ? x.teacher + ' ' : '') + '(' + num1(x.h) + ' h)').join(' ; ') }));
+    else if (f.kind === 'closed') out.push(t('Jours fériés et vacances, non comptés dans les heures dues : {h} h.', { h: num1(f.h) }));
+    else if (f.kind === 'excused') out.push(t('Activités scolaires et jours fériés déclarés, non comptés dans les heures dues : {h} h.', { h: num1(f.h) }));
+    else if (f.kind === 'revision') out.push(t('Intégration partielle des ressources : {h} h (comptées en heures, pas en leçons).', { h: num1(f.h) }));
+    else if (f.kind === 'assessment') out.push(t('Évaluations et remédiations : {h} h (comptées en heures, pas en leçons).', { h: num1(f.h) }));
+    else if (f.kind === 'regul') out.push(t('Régularisation d’heures : {h} h.', { h: (f.h > 0 ? '+' : '') + num1(f.h) }));
+  }
+  if (!out.length && S.gap >= 0) out.push(t('Aucun écart significatif.'));
+  return out.join('\n');
+}
+function actionTexts(S) {
+  const out = [];
+  for (const a of S.alerts) {
+    if (a.kind === 'hours') out.push(t('Couverture horaire inférieure au seuil de 80 % : mesures correctives obligatoires, à notifier à la Délégation Régionale sous huitaine (arrêté conjoint du 14/08/2026, art. 18).'));
+    if (a.kind === 'lessons') out.push(t('Couverture du programme inférieure au seuil de 70 % : examen en conseil d’enseignement et plan de remédiation (art. 21).'));
+    if (a.kind === 'success') out.push(t('Taux de réussite inférieur à 40 % : remédiation obligatoire (art. 21).'));
+  }
+  if (S.gap < 0) { out.push(t('Organiser des séances de rattrapage (samedis, plages libres) pour les classes dont les cours n’ont pas eu lieu.')); out.push(t('Reprogrammer les leçons en retard et en suivre l’exécution chaque semaine.')); }
+  out.push(t('Saisie régulière de tous les enseignants dans Rekort ; contrôle par l’animateur pédagogique chaque vendredi.'));
+  return out.join('\n');
+}
+function LetterSide({ text }) {
+  const lines = text.split('\n');
+  return html`<div><b>${lines[0]}</b>${lines.slice(1).map(l => html`<br />${l}`)}</div>`;
+}
+function Letterhead({ d, hd }) {
+  return html`<div class="hd"><${LetterSide} text=${letterText(hd, 'fr')} />
+      <div style="align-self:center">${showArms(hd) ? html`<img src="/icons/armoiries.png" alt="" style="width:74px;height:auto;display:block;margin:0 auto 4px" />` : null}<div style="font-weight:800;font-size:10px">${up(d.name)}</div></div>
+      <${LetterSide} text=${letterText(hd, 'en')} /></div>`;
+}
+
+const sg = (n) => html`<span class=${n < 0 ? 'neg' : n > 0 ? 'pos' : ''}>${(n > 0 ? '+' : '') + num1(n)}</span>`;
+
+export function Sheet({ ctx, tid, S, Y, p, who, facts, acts }) {
+  const lang = getLang(), d = ctx.dept, hd = d.header || {}, same = p.ps.slice(0, 4) === p.pe.slice(0, 4);
+  const teachers = tid ? ctx.teachers.filter(x => x.id === tid) : ctx.teachers;
+  const wk = (x) => (x.slots || []).reduce((s, y) => s + (+y.h || 0), 0);
+  const C = coverTotals(ctx, p.ps, p.pe, tid), CY = coverTotals(ctx, ctx.ys, p.pe, tid), YP = coverTotals(ctx, ctx.ys, ctx.ye, tid);   // mêmes chiffres que la fiche pédagogique de suivi
+  const yH = pct(CY.doneH, YP.planH), yL = pct(CY.doneL, YP.planL);
+  return html`<div class="paper">
+    <${Letterhead} d=${d} hd=${hd} />
+    <h2>${t('Fiche de l’inspection nationale')}</h2><div style="text-align:center;font-size:11px;margin-bottom:8px">${t('Année scolaire')} ${d.year || ''}</div>
+    <table><thead><tr><th rowspan="2">${t('Période')}</th><th rowspan="2">${t('Disciplines / Matières')}</th><th colspan="5">${t('Couverture des horaires')}</th><th colspan="5">${t('Couverture des programmes')}</th><th rowspan="2">${t('Identification des facteurs d’écart entre prévisions et exécution (programmes et plans d’horaires)')}</th><th rowspan="2">${t('Actions correctives / de remédiation')}</th></tr>
+      <tr><th>${t('Nombre d’heures dues pour la période')}</th><th>${t('Nombre d’heures faites')}</th><th>${t('Écart (+/-) par rapport à la période')}</th><th>${t('Taux de couverture par rapport à la période (%)')}</th><th>${t('Taux de couverture par rapport à l’année (%)')}</th>
+      <th>${t('Nombre de leçons prévues pour la période')}</th><th>${t('Nombre de leçons faites')}</th><th>${t('Écart (+/-) par rapport à la période')}</th><th>${t('Taux de couverture par rapport à la période (%)')}</th><th>${t('Taux de couverture par rapport à l’année (%)')}</th></tr></thead>
+    <tbody><tr><td style="font-size:11px">${t('Du {a} au {b}', { a: fmt(p.ps, lang), b: fmt(p.pe, lang) })}</td><td style="font-weight:800">${up(d.discipline)}${who ? html`<br /><span style="font-weight:600;font-size:10px">${who}</span>` : ''}</td>
+      <td>${num1(C.planH)}</td><td>${num1(C.doneH)}</td><td>${sg(C.doneH - C.planH)}</td><td>${num1(C.rateH)} %</td><td>${num1(yH)} %</td>
+      <td>${num1(C.planL)}</td><td>${num1(C.doneL)}</td><td>${sg(C.doneL - C.planL)}</td><td>${num1(C.rateL)} %</td><td>${num1(yL)} %</td>
+      <td class="l">${facts}</td><td class="l">${acts}</td></tr></tbody></table>
+    <p style="font-size:10px;margin:6px 0 0"><b>${t('Situation cumulée depuis la rentrée')} (${fmt(ctx.ys, lang, { noYear: ctx.ys.slice(0, 4) === Y.pe.slice(0, 4) })} ${t('au')} ${fmt(Y.pe, lang)}) : </b>${num1(CY.doneH)} h ${t('faites sur')} ${num1(CY.planH)} h ${t('prévues')} (${num1(CY.rateH)} %) · ${t('soit')} ${num1(yH)} % ${t('des')} ${num1(YP.planH)} h ${t('prévues sur l’année')} · ${num1(CY.doneL)} / ${num1(CY.planL)} ${t('leçons')} (${num1(CY.rateL)} %) · ${num1(yL)} % ${t('des')} ${num1(YP.planL)} ${t('leçons de l’année')}.</p>
+    <div class="sig"><div>${tid ? t('Enseignant(e)') : t('Animateur pédagogique')}<br /><b>${who || ((ctx.teacher(state.session.teacherId) || {}).name || '')}</b></div><div>${t('Censeur / Vice-Principal')}</div><div>${t('Proviseur / Principal')}</div></div>
+    <div class="annex"><div style="font-weight:800;font-size:12px;margin:0 0 6px">${tid ? t('Annexe : détail de mes heures') : t('Annexe : détail par enseignant')}</div>
+      <table><thead><tr><th>${t('Enseignant')}</th><th>${t('H / semaine')}</th><th>${t('Prévues')}</th><th>${t('Faites')}</th><th>${t('Écart')}</th><th>${t('Taux')}</th><th>${t('Leçons faites / prévues')}</th><th>${t('Dont intégration partielle, évaluations et remédiations (h)')}</th><th>${t('Absences déclarées (h)')}</th><th>${t('Retirées des heures dues (h)')}</th></tr></thead><tbody>
+      ${teachers.map(x => { const s = stats(ctx, x.id, p.ps, p.pe), c = coverTotals(ctx, p.ps, p.pe, x.id); return html`<tr><td style="text-align:left">${x.name}</td><td>${num1(wk(x))}</td><td>${num1(c.planH)}</td><td><b>${num1(c.doneH)}</b></td><td>${sg(c.doneH - c.planH)}</td><td>${num1(c.rateH)} %</td><td>${num1(c.doneL)} / ${num1(c.planL)}</td><td>${num1(s.revisionH + s.assessH)}</td><td>${num1(s.absent)}</td><td>${num1(s.excused + s.closed)}</td></tr>`; })}</tbody></table>
+      <p style="font-size:10px;margin:6px 0 0">${t('Heures prévues : emplois du temps sur la période, hors jours fériés, vacances et activités scolaires. Heures faites : séances saisies dans Rekort (intégration partielle, évaluations et remédiations comptent en heures mais pas en leçons), jamais au-delà du prévu. Leçons prévues : programme de chaque classe réparti selon les heures de cours. Ces chiffres sont ceux de la fiche pédagogique de suivi. Seuils d’alerte de l’arrêté conjoint du 14/08/2026 : {h} % (heures), {l} % (programme).', { h: THRESHOLDS.hours, l: THRESHOLDS.lessons })}</p></div></div>`;
+}
+
+const TERM_NAME = { T1: '1er trimestre', T2: '2e trimestre', T3: '3e trimestre' };
+const TERM_END = { T1: 'Fin du 1er trimestre', T2: 'Fin du 2e trimestre', T3: 'Fin du 3e trimestre' };
+function Follow({ ctx, p, tid }) {
+  const F = followUp(ctx, p.ps, p.pe, tid), lang = getLang(), d = ctx.dept, hd = d.header || {};
+  const live = p.kind === 'term' && TERM_END[p.term] && p.pe > ctx.today;   // trimestre en cours : on le dit
+  const full = p.kind === 'term' && TERM_END[p.term] ? (live ? t(TERM_NAME[p.term]) + ' · ' + t('situation au {d}', { d: fmt(ctx.today, lang) }) : t(TERM_END[p.term])) : t('Du {a} au {b}', { a: fmt(p.ps, lang), b: fmt(p.pe, lang) });
+  const P = (v) => num1(v);
+  const tail = (r) => (r.hasEv ? html`<td>${r.eff || ''}</td><td>${r.ev}</td><td>${P(r.rateEv)}</td><td>${r.remed ? r.ok : ''}</td><td>${r.remed ? P(r.rateOk) : ''}</td>` : html`<td>${r.eff || ''}</td><td></td><td></td><td></td><td></td>`);   // classe sans résultats saisis : cases vides
+  const body = (r) => html`<td>${P(r.planL)}</td><td>${P(r.doneL)}</td><td><b>${P(r.rateL)}</b></td><td>${r.planPr}</td><td>${r.pr}</td><td>${P(r.ratePr)}</td><td>${r.planPr}</td><td>${r.digital}</td><td>${P(r.rateDg)}</td>
+    <td>${P(r.planH)}</td><td>${P(r.doneH)}</td><td><b>${P(r.rateH)}</b></td>${tail(r)}`;
+  const line = (r) => html`<tr><td style="text-align:left">${r.name}</td><td>${up(d.abbr || d.discipline).slice(0, 4)}</td><td style="text-align:left">${r.teachers.join(', ')}</td>${body(r)}</tr>`;
+  const tot = (label, r, strong) => html`<tr style=${'font-weight:800;background:' + (strong ? '#F3ECDD' : '#EEF6F4')}><td colspan="3" style="text-align:left">${label}</td>${body(r)}</tr>`;
+  const cyc = (label, list, T) => list.length ? html`${list.map(line)}${tot(t('Total {c}', { c: label }), T, false)}` : null;
+  return html`${F.over.length ? html`<div class="notice no-print"><${Icon} n="alert" size="18" /><span>${t('Plafonné à 100 % (saisi au-delà du prévu) : {l}. Vérifiez ces classes dans l’historique et dans « Heures hors application ».', { l: F.over.map(r => r.name + ' (' + (r.rawL > r.planL + 0.05 ? num1(r.rawL) + ' / ' + num1(r.planL) + ' ' + t('leçons') : '') + (r.rawL > r.planL + 0.05 && r.rawH > r.planH + 0.05 ? ', ' : '') + (r.rawH > r.planH + 0.05 ? num1(r.rawH) + ' / ' + num1(r.planH) + ' h' : '') + ')').join(' ; ') })}</span></div>` : null}
+  <div class="paper wide">
+    <${Letterhead} d=${d} hd=${hd} />
+    <h2>${t('Fiche pédagogique de suivi')}</h2><div style="text-align:center;font-size:11px;margin-bottom:2px"><b>${full}</b> · ${t('Année scolaire')} ${d.year || ''}</div>
+    <div style="display:flex;justify-content:space-between;font-size:11px;margin:6px 0 8px"><span>${t('Établissement')} : <b>${up(d.name)}</b></span><span>${t('Discipline')} : <b>${up(d.discipline)}</b></span></div>
+    <table class="follow"><thead><tr><th rowspan="2">${t('Classe')}</th><th rowspan="2">${t('Matière')}</th><th rowspan="2">${t('Enseignant(s)')}</th><th colspan="3">${t('Leçons')}</th><th colspan="3">${t('Travaux pratiques')}</th><th colspan="3">${t('Digitalisation')}</th><th colspan="3">${t('Heures')}</th><th>${t('Effectif')}</th><th>${t('Évalués')}</th><th>${t('% évalués')}</th><th>${t('Moyenne ≥ 10')}</th><th>${t('Taux de réussite (%)')}</th></tr>
+      <tr><th>${t('Prév.')}</th><th>${t('Faites')}</th><th>%</th><th>${t('Prév.')}</th><th>${t('Faits')}</th><th>%</th><th>${t('Prév.')}</th><th>${t('Faits')}</th><th>%</th><th>${t('Prév.')}</th><th>${t('Faites')}</th><th>%</th><th>EFF</th><th>EVAL</th><th>%EVAL</th><th>≥10</th><th>%</th></tr></thead>
+      <tbody>${F.n ? html`${cyc(t('1er cycle'), F.g1, F.t1)}${cyc(t('2nd cycle'), F.g2, F.t2)}${tot(t('TOTAL GÉNÉRAL'), F.total, true)}` : html`<tr><td colspan="20">${t('Aucune classe')}</td></tr>`}</tbody></table>
+    <p style="font-size:9px;margin:6px 0 0">${t('Prév. = prévu pour la période (leçons du programme réparties selon les heures de cours ; heures dues d’après les emplois du temps). Faites = ce qui est réalisé, jamais au-delà du prévu. % = Faites ÷ Prév. Le total annuel est la somme des trimestres. Travaux pratiques et digitalisation : cumul depuis la rentrée face au prévu de l’année. Effectif, évalués, moyenne ≥ 10 et taux de réussite : saisis par l’enseignant le jour de l’évaluation et de la remédiation, séquences de la période cumulées (trimestre = ses deux séquences) ; case vide = pas encore saisi.')}</p>
+    <div class="sig"><div>${tid ? t('Enseignant(e)') : t('Animateur pédagogique')}<br /><b>${((ctx.teacher(tid || state.session.teacherId) || {}).name || '')}</b></div><div>${t('Censeur / Vice-Principal')}</div><div>${t('Proviseur / Principal')}</div></div></div>`;
+}
+
+/** Aperçu : la fiche (format A4) est réduite pour tenir dans la largeur du téléphone, sans toucher à l'impression. */
+function fitPaper() {
+  const box = document.querySelector('.paper-fit'), paper = box && box.querySelector('.paper'); if (!paper) return;
+  paper.style.zoom = ''; const w = paper.scrollWidth, avail = box.clientWidth;
+  if (w > avail + 2) paper.style.zoom = String(Math.max(0.3, avail / w));
+}
+
+/** Évaluations et assiduité par classe sur la période : seuils de l'arrêté (réussite 40 %, assiduité 75 %). */
+function Evals({ ctx, p, tid }) {
+  const lang = getLang(), d = ctx.dept, hd = d.header || {}, P = (v) => (v == null ? '—' : num1(v) + ' %');
+  const R = seqResults(ctx), terms = ctx.terms.map((tm, i) => ({ k: i + 1, tm })).filter(x => x.tm.start <= p.pe && x.tm.end >= p.ps);
+  const seqs = terms.flatMap(x => [2 * x.k - 1, 2 * x.k]);
+  const classes = ctx.classes.filter(c => !tid || ctx.assign.some(a => a.classId === c.id && a.teacherId === tid));
+  const cell = (r) => r ? html`<td style=${r.rate != null && r.rate < 40 ? 'color:#C0472A;font-weight:800' : ''}>${r.rate != null ? P(r.rate) : t('composé')}<div style="font-size:8.5px;color:#555">${r.comp}/${r.size || '?'}${r.rate != null ? ' · F ' + P(r.rateF) + ' · G ' + P(r.rateG) : ''}</div></td>` : html`<td>—</td>`;
+  const one = (x) => (x ? cumulate([x]) : null);
+  const rows = classes.map(c => ({ c, s: seqs.map(q => one((R[c.id] || {})[q])), tr: terms.map(x => { const l = [2 * x.k - 1, 2 * x.k].map(q => (R[c.id] || {})[q]).filter(Boolean); return l.length ? cumulate(l) : null; }) })).filter(r => r.s.some(Boolean));
+  const dep = { s: seqs.map(q => { const l = classes.map(c => (R[c.id] || {})[q]).filter(Boolean); return l.length ? cumulate(l) : null; }), tr: terms.map(x => { const l = classes.flatMap(c => [2 * x.k - 1, 2 * x.k].map(q => (R[c.id] || {})[q])).filter(Boolean); return l.length ? cumulate(l) : null; }) };
+  const es = ctx.entries.filter(e => e.type !== 'absence' && e.date >= p.ps && e.date <= p.pe && (!tid || e.teacherId === tid));
+  const att = ctx.classes.map(c => { const pres = es.filter(e => e.classId === c.id && e.present != null && e.present !== ''), eff = +(c.effectif || {}).total || 0;
+    return { c, n: pres.length, eff, att: pres.length && eff ? pres.reduce((s, e) => s + Math.min(eff, +e.present), 0) / (pres.length * eff) * 100 : null }; }).filter(r => r.n);
+  return html`<div class="paper">
+    <${Letterhead} d=${d} hd=${hd} />
+    <h2>${t('Résultats des évaluations par séquence')}</h2><div style="text-align:center;font-size:11px;margin-bottom:8px">${terms.map(x => x.tm.name || t('Trimestre {k}', { k: x.k })).join(' · ')} · ${up(d.discipline)} · ${t('Année scolaire')} ${d.year || ''}</div>
+    <table><thead><tr><th>${t('Classe')}</th>${seqs.map(q => html`<th>${t('Séquence {s}', { s: q })}</th>`)}${terms.map(x => html`<th>${t('Trimestre {k}', { k: x.k })}</th>`)}</tr></thead>
+      <tbody>${rows.length ? rows.map(r => html`<tr><td style="text-align:left">${r.c.name}</td>${r.s.map(cell)}${r.tr.map(x => (x ? html`<td style="font-weight:800">${x.rate != null ? P(x.rate) : '—'}<div style="font-size:8.5px;color:#555;font-weight:400">${x.pass}/${x.comp}</div></td>` : html`<td>—</td>`))}</tr>`)
+        : html`<tr><td colspan=${1 + seqs.length + terms.length}>${t('Aucun résultat saisi. Le jour de la remédiation, l’enseignant saisit : élèves de la classe, ont composé, ont réussi (filles et garçons).')}</td></tr>`}
+      ${rows.length ? html`<tr style="font-weight:800;background:#F3ECDD"><td style="text-align:left">${t('Département')}</td>${dep.s.map(x => html`<td>${x && x.rate != null ? P(x.rate) : '—'}</td>`)}${dep.tr.map(x => html`<td>${x && x.rate != null ? P(x.rate) : '—'}</td>`)}</tr>` : null}</tbody></table>
+    <p style="font-size:9px;margin:6px 0 0">${t('Taux de réussite = élèves ayant la moyenne ÷ élèves ayant composé. Trimestre = cumul de ses deux séquences. Sous chaque taux : composés / effectif, puis filles (F) et garçons (G). En rouge : sous le seuil de 40 % (arrêté conjoint du 14/08/2026).')}</p>
+    ${att.length ? html`<h3 style="font-size:11px;margin:12px 0 4px">${t('Assiduité des élèves')}</h3><table><thead><tr><th>${t('Classe')}</th><th>${t('Effectif')}</th><th>${t('Cours avec présences')}</th><th>${t('Taux d’assiduité')}</th></tr></thead><tbody>${att.map(r => html`<tr><td style="text-align:left">${r.c.name}</td><td>${r.eff}</td><td>${r.n}</td><td style=${r.att < 75 ? 'color:#C0472A;font-weight:800' : ''}>${P(r.att)}</td></tr>`)}</tbody></table>` : null}
+    <div class="sig"><div>${t('Animateur pédagogique')}<br /><b>${((ctx.teacher(state.session.teacherId) || {}).name || '')}</b></div><div>${t('Censeur / Vice-Principal')}</div><div>${t('Proviseur / Principal')}</div></div></div>`;
+}
+
+/** Bilan d'une page pour le censeur : situation du département, collègues, classes en retard, mesures. */
+function Bilan({ ctx, p, S, facts, acts }) {
+  const lang = getLang(), d = ctx.dept, hd = d.header || {};
+  const per = ctx.teachers.map(tc => ({ tc, S: coverTotals(ctx, p.ps, p.pe, tc.id) })), CB = coverTotals(ctx, p.ps, p.pe), ended = p.pe <= ctx.today;
+  const lateCls = ctx.teachers.flatMap(tc => classProgress(ctx, tc.id, minISO(p.pe, ctx.today)).filter(r => r.status === 'late' || r.status === 'slight').map(r => ({ ...r, who: tc.short || tc.name })));
+  return html`<div class="paper">
+    <${Letterhead} d=${d} hd=${hd} />
+    <h2>${t('Bilan du département')}</h2><div style="text-align:center;font-size:11px;margin-bottom:8px">${t('Du {a} au {b}', { a: fmt(p.ps, lang), b: fmt(p.pe, lang) })} · ${up(d.discipline)} · ${t('Année scolaire')} ${d.year || ''}</div>
+    <table><thead><tr><th>${t('Indicateur')}</th><th>${t('Fait')}</th><th>${t('Prévu')}</th><th>%</th><th>${t('Seuil')}</th></tr></thead><tbody>
+      <tr><td style="text-align:left">${t('Couverture horaire')}</td><td>${num1(CB.doneH)} h</td><td>${num1(CB.planH)} h</td><td>${num1(CB.rateH)} %</td><td>80 %</td></tr>
+      <tr><td style="text-align:left">${t('Couverture du programme (leçons)')}</td><td>${num1(CB.doneL)}</td><td>${num1(CB.planL)}</td><td>${num1(CB.rateL)} %</td><td>70 %</td></tr></tbody></table>
+    <h3 style="font-size:11px;margin:10px 0 4px">${t('Par enseignant')}</h3>
+    <table><thead><tr><th>${t('Enseignant')}</th><th>${t('Heures faites / prévues')}</th><th>%</th><th>${t('Leçons faites / prévues')}</th><th>%</th></tr></thead><tbody>
+      ${per.map(({ tc, S: x }) => html`<tr><td style="text-align:left">${tc.name}</td><td>${num1(x.doneH)} / ${num1(x.planH)}</td><td style=${ended && x.planH && x.rateH < 80 ? 'color:#C0472A;font-weight:800' : ''}>${num1(x.rateH)} %</td><td>${num1(x.doneL)} / ${num1(x.planL)}</td><td style=${ended && x.planL && x.rateL < 70 ? 'color:#C0472A;font-weight:800' : ''}>${num1(x.rateL)} %</td></tr>`)}</tbody></table>
+    <h3 style="font-size:11px;margin:10px 0 4px">${t('Classes en retard sur le programme')}</h3>
+    <p style="font-size:10px;margin:0">${lateCls.length ? lateCls.map(r => r.name + ' (' + r.who + ', ' + t('{n} leçon(s) de retard', { n: num1(r.lag) }) + ')').join(' ; ') : t('Aucune.')}</p>
+    <h3 style="font-size:11px;margin:10px 0 4px">${t('Facteurs d’écart')}</h3><p style="font-size:10px;margin:0;white-space:pre-line">${facts}</p>
+    <h3 style="font-size:11px;margin:10px 0 4px">${t('Mesures proposées')}</h3><p style="font-size:10px;margin:0;white-space:pre-line">${acts}</p>
+    <div class="sig"><div>${t('Animateur pédagogique')}<br /><b>${((ctx.teacher(state.session.teacherId) || {}).name || '')}</b></div><div>${t('Censeur / Vice-Principal')}</div><div>${t('Proviseur / Principal')}</div></div></div>`;
+}
+
+export function Report() {
+  useEffect(() => { fitPaper(); const f = () => fitPaper(); addEventListener('resize', f); return () => removeEventListener('resize', f); });
+  const ctx = makeCtx(viewData()), ap = isAP(), tid = currentTid();
+  const [tab, setTab] = useState('sheet'), [edit, setEdit] = useState({ ft: null, ac: null });
+  const p = state.ui.rperiod && state.ui.rperiod.ps ? state.ui.rperiod : { kind: 'custom', ps: ctx.ys, pe: minISO(ctx.today, ctx.ye) };
+  const S = stats(ctx, tid, p.ps, p.pe), Y = stats(ctx, tid, ctx.ys, p.pe);
+  const who = tid ? (ctx.teacher(tid) || {}).name : '';
+  const facts = edit.ft != null ? edit.ft : factorTexts(ctx, S), acts = edit.ac != null ? edit.ac : actionTexts(S);
+  return html`<div class="page"><div class="page-h noprint"><h1>${({ sheet: t('Fiche d’inspection'), recap: t('Fiche pédagogique'), bilan: t('Bilan du département'), evals: t('Évaluations et assiduité') })[tab]}</h1></div>
+    <div class="export-bar noprint"><button class="btn accent" onClick=${() => window.print()}><${Icon} n="print" />${t('Imprimer PDF')}</button><button class="btn" onClick=${() => exportWord(document.querySelector('.paper'), 'rekort-' + ({ sheet: 'fiche-inspection', recap: 'fiche-pedagogique', bilan: 'bilan', evals: 'evaluations' }[tab] || 'fiche') + '-' + ctx.today)}><${Icon} n="download" />${t('Imprimer Word')}</button></div>
+    <div class="noprint stack"><${YearBar} /><${ScopeBar} ctx=${ctx} />${ap && !ctx.assign.some(x => (+x.th || 0) + (+x.pr || 0) > 0) ? html`<a class="notice" href="#/settings/classes"><${Icon} n="alert" size="18" /><span>${t('Les leçons et heures prévues pour l’année ne sont pas encore renseignées : la colonne « prévues » de la fiche affiche 0. Touchez ici pour les saisir, classe par classe.')}</span></a>` : null}<div class="scope-big sm"><${Seg} full options=${[{ id: 'sheet', label: '📋 ' + t('Inspection') }, { id: 'recap', label: '🏫 ' + t('Censorat') }, ...(ap ? [{ id: 'bilan', label: '📝 ' + t('Bilan') }] : [])]} value=${tab} onChange=${setTab} /></div>
+      <div class="card"><div class="card-h"><h3>${t('Période demandée par l’inspecteur')}</h3></div><${PeriodBar} ctx=${ctx} period=${p} onChange=${(np) => { setUI({ rperiod: np }); setEdit({ ft: null, ac: null }); }} />
+        <div class="row" style="margin-top:10px"><button class="btn soft sm" onClick=${() => setUI({ rperiod: { kind: 'custom', ps: ctx.ys, pe: minISO(ctx.today, ctx.ye) } })}>${t('De la rentrée à aujourd’hui')}</button></div></div>
+      ${S.alerts.length ? html`<div class="err">${S.alerts.map(a => a.kind === 'hours' ? t('Couverture horaire sous 80 % : mesures correctives obligatoires.') : a.kind === 'lessons' ? t('Couverture du programme sous 70 % : plan de remédiation.') : t('Taux de réussite sous 40 %.')).join(' ')}</div>` : null}
+      ${tab === 'sheet' ? html`<div class="card"><div class="card-h"><h3>${t('Commentaires de la fiche')}</h3><button class="btn soft sm" onClick=${() => setEdit({ ft: null, ac: null })}><${Icon} n="refresh" />${t('Régénérer')}</button></div>
+        <div class="grid2"><div class="field"><label>${t('Facteurs d’écart')}</label><textarea class="input" rows="5" value=${facts} onInput=${(e) => setEdit({ ...edit, ft: e.target.value })}></textarea></div><div class="field"><label>${t('Actions correctives')}</label><textarea class="input" rows="5" value=${acts} onInput=${(e) => setEdit({ ...edit, ac: e.target.value })}></textarea></div></div><p class="hint" style="margin-top:8px">${t('Texte proposé automatiquement ; vous pouvez le modifier avant d’imprimer.')}</p></div>` : null}</div>
+    <p class="sub noprint" style="text-align:center">${t('Aperçu de la fiche, réduit à la largeur de l’écran (l’impression et Word gardent la taille réelle).')}</p>
+    <div class="paper-fit">${tab === 'sheet' ? html`<${Sheet} ctx=${ctx} tid=${tid} S=${S} Y=${Y} p=${p} who=${who} facts=${facts} acts=${acts} />` : tab === 'bilan' ? html`<${Bilan} ctx=${ctx} p=${p} S=${stats(ctx, null, p.ps, p.pe)} facts=${facts} acts=${acts} />` : html`<${Follow} tid=${tid} ctx=${ctx} p=${p} />`}</div></div>`;
+}
